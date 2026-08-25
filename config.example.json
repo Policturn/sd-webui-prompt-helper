@@ -1,0 +1,7 @@
+{
+  "enabled": true,
+  "path": "E:\\path\\to\\your\\prompt.txt",
+  "position": "追加到末尾",
+  "inject_negative": false,
+  "merge_lines": true
+}
