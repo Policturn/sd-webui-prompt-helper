@@ -3,5 +3,7 @@
   "path": "E:\\path\\to\\your\\prompt.txt",
   "position": "追加到末尾",
   "inject_negative": false,
-  "merge_lines": true
+  "merge_lines": true,
+  "autostart": false,
+  "editor_path": "E:\\path\\to\\your\\tag-editor.exe"
 }

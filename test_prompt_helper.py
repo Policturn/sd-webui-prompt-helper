@@ -8,6 +8,7 @@ import importlib.util
 import os
 import sys
 import tempfile
+import time
 import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -49,12 +50,19 @@ class Script:  # noqa: N801 - 模拟 modules.scripts.Script
 
 scripts_mod.Script = Script
 scripts_mod.AlwaysVisible = object()
+
+callbacks_mod = types.ModuleType("modules.script_callbacks")
+_registered_callbacks = []
+callbacks_mod.on_app_started = lambda cb, name=None: _registered_callbacks.append(cb)
+
 modules_pkg = types.ModuleType("modules")
 modules_pkg.scripts = scripts_mod
+modules_pkg.script_callbacks = callbacks_mod
 
 sys.modules["gradio"] = gradio
 sys.modules["modules"] = modules_pkg
 sys.modules["modules.scripts"] = scripts_mod
+sys.modules["modules.script_callbacks"] = callbacks_mod
 
 # 真实加载模块（runpy.run_path 返回全局字典副本，补丁不会生效）
 spec = importlib.util.spec_from_file_location("prompt_helper", SCRIPT_PATH)
@@ -113,33 +121,56 @@ print("== before_process 注入 ==")
 script = ns["PromptHelperScript"]()
 
 p = FakeP()
-script.before_process(p, True, REAL_TXT, "追加到末尾", False, True)
+script.before_process(p, True, REAL_TXT, "追加到末尾", False, True, False, "")
 check("追加到末尾", p.prompt == "masterpiece, best quality" + ", " + text and p.negative_prompt == "lowres")
 
 p = FakeP()
-script.before_process(p, True, REAL_TXT, "插入到最前", True, True)
+script.before_process(p, True, REAL_TXT, "插入到最前", True, True, False, "")
 base = ns["read_tag_file"](REAL_TXT)[0]
 check("插入到最前 + 反向注入", p.prompt == base + ", masterpiece, best quality"
       and p.negative_prompt == base + ", lowres")
 
 p = FakeP()
-script.before_process(p, False, REAL_TXT, "追加到末尾", False, True)
+script.before_process(p, False, REAL_TXT, "追加到末尾", False, True, False, "")
 check("停用时不注入", p.prompt == "masterpiece, best quality")
 
 p = FakeP()
 p.prompt = ["a", "b"]
-script.before_process(p, True, REAL_TXT, "追加到末尾", False, True)
+script.before_process(p, True, REAL_TXT, "追加到末尾", False, True, False, "")
 check("列表提示词逐项注入", p.prompt == ["a, " + base, "b, " + base])
 
 p = FakeP()
-script.before_process(p, True, r"C:\__no_such_file__.txt", "追加到末尾", False, True)
+script.before_process(p, True, r"C:\__no_such_file__.txt", "追加到末尾", False, True, False, "")
 check("缺文件时跳过且不报错", p.prompt == "masterpiece, best quality")
+
+print("== 编辑器联动启动 ==")
+check("on_app_started 回调已注册", len(_registered_callbacks) >= 1)
+ok, msg = ns["launch_editor"]("")
+check("空路径返回错误", not ok and "未设置" in msg)
+ok, msg = ns["launch_editor"](r"C:\__no_editor__.exe")
+check("无效路径返回错误", not ok and "不存在" in msg)
+check("进程检测：不存在的进程", ns["_is_process_running"]("definitely_not_running_zzz.exe") is False)
+with tempfile.NamedTemporaryFile("w", suffix=".bat", delete=False) as f:
+    f.write("@exit 0")
+    bat_path = f.name
+ok, msg = ns["launch_editor"](bat_path)
+print(f"  独立进程启动 -> [{msg}]")
+check("独立进程启动成功", ok)
+time.sleep(0.3)
+try:
+    os.unlink(bat_path)
+except OSError:
+    pass
+ns["_on_app_started"]()  # 临时配置 autostart 默认关闭，应直接返回
+check("autostart 关闭时启动回调无动作", True)
 
 print("== config 读写 ==")
 ns["_save_config"]({"enabled": False, "path": "X", "position": "插入到最前",
-                     "inject_negative": True, "merge_lines": False})
+                     "inject_negative": True, "merge_lines": False,
+                     "autostart": True, "editor_path": "Y"})
 cfg = ns["_load_config"]()
 check("配置读写往返一致", cfg["position"] == "插入到最前" and cfg["enabled"] is False
-      and cfg["inject_negative"] is True and cfg["merge_lines"] is False)
+      and cfg["inject_negative"] is True and cfg["merge_lines"] is False
+      and cfg["autostart"] is True and cfg["editor_path"] == "Y")
 
 print("\n全部测试通过 ✔")
