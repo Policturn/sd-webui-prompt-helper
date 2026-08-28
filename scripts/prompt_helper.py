@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """外部提示词注入（prompt-helper 桥接插件）
 
-在文生图 / 图生图页面各提供一个常驻控制栏：指定一个 txt 文件（由
-prompt-helper / FeeTagHelper 等外部词条编辑器实时输出），每次生成任务
-开始时现场重新读取该文件，并把词条拼接到本次的正向（可选反向）提示词。
+在文生图 / 图生图页面各提供一个常驻控制栏：指定正向 / 反向两个 txt 词条
+文件（由 prompt-helper / FeeTagHelper 等外部词条编辑器实时输出），每次
+生成任务开始时现场重新读取文件，并把词条分别拼接到本次的正向、反向提示词
+（反向路径留空则只注入正向）。
 
 注入发生在提示词编译之前的 before_process 阶段，因此：
 - 每次点击"生成"（包括队列中的每个任务）都会重新读盘，始终拿到最新词条；
@@ -28,14 +29,14 @@ EXT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(EXT_DIR, "config.json")
 
 POSITIONS = ("追加到末尾", "插入到最前")
-CONTROL_KEYS = ("enabled", "path", "position", "inject_negative", "merge_lines",
+CONTROL_KEYS = ("enabled", "path", "negative_path", "position", "merge_lines",
                 "autostart", "editor_path")
 
 DEFAULT_CONFIG = {
     "enabled": True,
     "path": "",
+    "negative_path": "",
     "position": POSITIONS[0],
-    "inject_negative": False,
     "merge_lines": True,
     "autostart": False,
     "editor_path": "",
@@ -62,10 +63,10 @@ def _load_config():
         pass
     if cfg["position"] not in POSITIONS:
         cfg["position"] = DEFAULT_CONFIG["position"]
-    for key in ("enabled", "inject_negative", "merge_lines", "autostart"):
+    for key in ("enabled", "merge_lines", "autostart"):
         cfg[key] = bool(cfg[key])
-    cfg["path"] = str(cfg["path"] or "")
-    cfg["editor_path"] = str(cfg["editor_path"] or "")
+    for key in ("path", "negative_path", "editor_path"):
+        cfg[key] = str(cfg[key] or "")
     return cfg
 
 
@@ -162,18 +163,39 @@ def launch_editor(editor_path):
     return True, "已启动：" + editor_path
 
 
-def _preview(path, merge_lines):
+def _file_hint(path, text):
     normalized = _normalize_path(path)
-    text, message = read_tag_file(path, merge_lines)
-    if text is None:
-        return "", f"<span style='color:#e5484d'>✗ {html.escape(message)}</span>"
     try:
         updated = time.strftime("%H:%M:%S", time.localtime(os.path.getmtime(normalized)))
     except OSError:
         updated = "?"
     tag_count = len([t for t in (x.strip() for x in text.split(",")) if t])
-    hint = f"<span style='color:#30a46c'>✓ {html.escape(message)} · {tag_count} 个词条 · 文件更新于 {updated}</span>"
-    return text, hint
+    return f"文件正常 · {tag_count} 个词条 · 文件更新于 {updated}"
+
+
+def _preview(path, negative_path, merge_lines):
+    parts = []
+
+    text, message = read_tag_file(path, merge_lines)
+    if text is None:
+        pos_preview = ""
+        parts.append(f"<span style='color:#e5484d'>✗ 正向：{html.escape(message)}</span>")
+    else:
+        pos_preview = text
+        parts.append(f"<span style='color:#30a46c'>✓ 正向：{_file_hint(path, text)}</span>")
+
+    neg_preview = ""
+    if _normalize_path(negative_path):
+        neg_text, neg_message = read_tag_file(negative_path, merge_lines)
+        if neg_text is None:
+            parts.append(f"<span style='color:#e5484d'>✗ 反向：{html.escape(neg_message)}</span>")
+        else:
+            neg_preview = neg_text
+            parts.append(f"<span style='color:#30a46c'>✓ 反向：{_file_hint(negative_path, neg_text)}</span>")
+    else:
+        parts.append("<span style='color:#888'>反向：未设置（留空则不注入）</span>")
+
+    return pos_preview, neg_preview, "<br>".join(parts)
 
 
 def _launch_click(editor_path):
@@ -222,14 +244,19 @@ class PromptHelperScript(Script):
 
             path = gr.Textbox(
                 value=cfg["path"],
-                label="词条 txt 文件路径",
+                label="正向词条 txt 文件路径",
                 placeholder="例如：E:\\桌面\\AI file\\Design file\\prompt-helper\\prompt.txt",
                 lines=1,
             )
 
-            with gr.Row():
-                inject_negative = gr.Checkbox(value=cfg["inject_negative"], label="同时注入反向提示词")
-                merge_lines = gr.Checkbox(value=cfg["merge_lines"], label="将文件内换行合并为一行")
+            negative_path = gr.Textbox(
+                value=cfg["negative_path"],
+                label="反向词条 txt 文件路径（留空则不注入反向）",
+                placeholder="例如：E:\\桌面\\AI file\\Design file\\prompt-helper\\negative.txt",
+                lines=1,
+            )
+
+            merge_lines = gr.Checkbox(value=cfg["merge_lines"], label="将文件内换行合并为一行")
 
             autostart = gr.Checkbox(value=cfg["autostart"], label="启动 WebUI 时自动打开词条编辑器")
             editor_path = gr.Textbox(
@@ -241,46 +268,57 @@ class PromptHelperScript(Script):
             launch_status = gr.HTML()
             launch_button = gr.Button(value="立即启动编辑器（测试）")
 
-            preview = gr.Textbox(label="文件内容预览（只读）", lines=3, interactive=False)
+            with gr.Row():
+                preview = gr.Textbox(label="正向文件预览（只读）", lines=3, interactive=False)
+                negative_preview = gr.Textbox(label="反向文件预览（只读）", lines=3, interactive=False)
             status = gr.HTML()
             refresh = gr.Button(value="刷新预览")
 
-        refresh.click(fn=_preview, inputs=[path, merge_lines], outputs=[preview, status])
-        path.submit(fn=_preview, inputs=[path, merge_lines], outputs=[preview, status])
+        refresh.click(fn=_preview, inputs=[path, negative_path, merge_lines],
+                      outputs=[preview, negative_preview, status])
+        path.submit(fn=_preview, inputs=[path, negative_path, merge_lines],
+                    outputs=[preview, negative_preview, status])
+        negative_path.submit(fn=_preview, inputs=[path, negative_path, merge_lines],
+                             outputs=[preview, negative_preview, status])
         launch_button.click(fn=_launch_click, inputs=[editor_path], outputs=[launch_status])
 
         controls = {
             "enabled": enabled,
             "path": path,
+            "negative_path": negative_path,
             "position": position,
-            "inject_negative": inject_negative,
             "merge_lines": merge_lines,
             "autostart": autostart,
             "editor_path": editor_path,
         }
         _wire_controls(controls, is_img2img)
 
-        return [enabled, path, position, inject_negative, merge_lines, autostart, editor_path]
+        return [enabled, path, negative_path, position, merge_lines, autostart, editor_path]
 
-    def before_process(self, p, enabled, path, position, inject_negative, merge_lines, autostart, editor_path):
+    def before_process(self, p, enabled, path, negative_path, position, merge_lines, autostart, editor_path):
         """每次生成任务触发一次，早于提示词列表构建，改 p.prompt 即可全量生效。"""
-        _save_config(dict(zip(CONTROL_KEYS, (enabled, path, position, inject_negative,
+        _save_config(dict(zip(CONTROL_KEYS, (enabled, path, negative_path, position,
                                               merge_lines, autostart, editor_path))))
         if not enabled:
             return
 
+        prepend = position == POSITIONS[1]
+
         tags, message = read_tag_file(path, merge_lines)
         if tags is None:
-            _log(f"跳过注入：{message}")
-            return
+            _log(f"正向跳过注入：{message}")
+        else:
+            p.prompt = _inject(p.prompt, tags, prepend)
+            shown = tags[:120] + ("…" if len(tags) > 120 else "")
+            _log(f"正向已注入 {len(tags)} 个字符（{message}）：{shown}")
 
-        prepend = position == POSITIONS[1]
-        p.prompt = _inject(p.prompt, tags, prepend)
-        if inject_negative:
-            p.negative_prompt = _inject(p.negative_prompt, tags, prepend)
-
-        shown = tags[:120] + ("…" if len(tags) > 120 else "")
-        _log(f"已注入 {len(tags)} 个字符（{message}）：{shown}")
+        if _normalize_path(negative_path):
+            neg_tags, neg_message = read_tag_file(negative_path, merge_lines)
+            if neg_tags is None:
+                _log(f"反向跳过注入：{neg_message}")
+            else:
+                p.negative_prompt = _inject(p.negative_prompt, neg_tags, prepend)
+                _log(f"反向已注入 {len(neg_tags)} 个字符（{neg_message}）")
 
 
 def _on_app_started(demo=None, app=None):
