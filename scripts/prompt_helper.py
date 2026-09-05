@@ -16,6 +16,14 @@ FeeTagHelper 构建区可能在 txt 末尾追加元数据 tag（<fth:meta:…>�
 把平铺 tag 流断开为空行分隔（A1111 BREAK 语法），并把解码后的元数据写入
 PNG 的 extra_generation_params（键 fth_meta / fth_meta_negative，附插件版本）。
 
+v1.4.1 起注入位置确定化：词条恒定拼接在提示词最前，最终送入 CLIP 的文本
+结构恒为 [注入词条][提示框原有内容]（旧版"插入位置"选项已移除，config 里的
+残留 position 键会被读取白名单忽略）。fth_meta / fth_meta_negative 同时新增
+injected_tags（注入区 tag 数，按逗号拆分计数，与编辑器自然条 offset 同基准）
+与 full_text（注入后的完整提示词）两个字段——75 token 分块发生在 CLIP 编码
+内部，before_process 阶段拿不到分块结果，编辑器端用自带 tokenizer 依据
+full_text 自行计算分块对齐。
+
 另提供可选联动：WebUI 启动完成时自动拉起外部词条编辑器（on_app_started
 回调；防重复启动；编辑器作为独立进程运行，关闭 WebUI 不会连带关闭它）。
 """
@@ -36,17 +44,15 @@ from modules.scripts import AlwaysVisible, Script
 EXT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(EXT_DIR, "config.json")
 
-PLUGIN_VERSION = "1.4.0"
+PLUGIN_VERSION = "1.4.1"
 
-POSITIONS = ("追加到末尾", "插入到最前")
-CONTROL_KEYS = ("enabled", "path", "negative_path", "position", "merge_lines",
+CONTROL_KEYS = ("enabled", "path", "negative_path", "merge_lines",
                 "autostart", "editor_path")
 
 DEFAULT_CONFIG = {
     "enabled": True,
     "path": "",
     "negative_path": "",
-    "position": POSITIONS[0],
     "merge_lines": True,
     "autostart": False,
     "editor_path": "",
@@ -75,8 +81,6 @@ def _load_config():
                     cfg[key] = loaded[key]
     except (OSError, ValueError):
         pass
-    if cfg["position"] not in POSITIONS:
-        cfg["position"] = DEFAULT_CONFIG["position"]
     for key in ("enabled", "merge_lines", "autostart"):
         cfg[key] = bool(cfg[key])
     for key in ("path", "negative_path", "editor_path"):
@@ -127,12 +131,18 @@ def read_tag_file(path, merge_lines=True):
     return None, last_error
 
 
-def _inject(base, tags, prepend, sep=", "):
+def _inject(base, tags, sep=", "):
+    # v1.4.1 起注入位置确定化：词条恒定拼接在最前，结构恒为 [注入词条][base]
     if isinstance(base, list):
-        return [_inject(item, tags, prepend, sep) for item in base]
+        return [_inject(item, tags, sep) for item in base]
     if not base:
         return tags
-    return f"{tags}{sep}{base}" if prepend else f"{base}{sep}{tags}"
+    return f"{tags}{sep}{base}"
+
+
+def _count_tags(text):
+    """按逗号拆分统计非空 tag 数（与编辑器自然条 offset 同基准，BREAK 展开前计数）。"""
+    return len([t for t in (x.strip() for x in text.split(",")) if t])
 
 
 def _decode_meta_payload(payload):
@@ -244,14 +254,19 @@ def _file_hint(path, text):
         updated = time.strftime("%H:%M:%S", time.localtime(os.path.getmtime(normalized)))
     except OSError:
         updated = "?"
-    tag_count = len([t for t in (x.strip() for x in text.split(",")) if t])
+    tag_count = _count_tags(text)
     return f"文件正常 · {tag_count} 个词条 · 文件更新于 {updated}"
 
 
-def _record_meta_png(p, meta, key):
-    """把剥离出的元数据（附插件版本号）写进 PNG 生成信息：参数面板可见、读图可还原。"""
+def _record_meta_png(p, meta, key, fields):
+    """把注入统计字段 + 剥离出的元数据（附插件版本号）写进 PNG 生成信息。
+
+    fields 为本次注入的统计（injected_tags / full_text 等）；meta 可能为 None
+    （txt 未携带元数据 tag 时统计字段照常记录）。记录失败不影响生成。
+    """
     try:
-        recorded = dict(meta)
+        recorded = dict(meta) if meta else {}
+        recorded.update(fields)
         recorded["plugin"] = PLUGIN_VERSION
         p.extra_generation_params[key] = json.dumps(recorded, ensure_ascii=False)
     except (AttributeError, TypeError, ValueError):
@@ -327,9 +342,10 @@ class PromptHelperScript(Script):
 
         with gr.Accordion("外部提示词注入（实时读取 txt）", open=False,
                           elem_id=f"prompt-helper-{'img2img' if is_img2img else 'txt2img'}"):
-            with gr.Row():
-                enabled = gr.Checkbox(value=cfg["enabled"], label="启用注入")
-                position = gr.Radio(choices=list(POSITIONS), value=cfg["position"], label="插入位置")
+            enabled = gr.Checkbox(
+                value=cfg["enabled"],
+                label="启用注入（词条恒拼接在提示词最前）",
+            )
 
             path = gr.Textbox(
                 value=cfg["path"],
@@ -375,23 +391,20 @@ class PromptHelperScript(Script):
             "enabled": enabled,
             "path": path,
             "negative_path": negative_path,
-            "position": position,
             "merge_lines": merge_lines,
             "autostart": autostart,
             "editor_path": editor_path,
         }
         _wire_controls(controls, is_img2img)
 
-        return [enabled, path, negative_path, position, merge_lines, autostart, editor_path]
+        return [enabled, path, negative_path, merge_lines, autostart, editor_path]
 
-    def before_process(self, p, enabled, path, negative_path, position, merge_lines, autostart, editor_path):
+    def before_process(self, p, enabled, path, negative_path, merge_lines, autostart, editor_path):
         """每次生成任务触发一次，早于提示词列表构建，改 p.prompt 即可全量生效。"""
-        _save_config(dict(zip(CONTROL_KEYS, (enabled, path, negative_path, position,
+        _save_config(dict(zip(CONTROL_KEYS, (enabled, path, negative_path,
                                               merge_lines, autostart, editor_path))))
         if not enabled:
             return
-
-        prepend = position == POSITIONS[1]
 
         tags, message = read_tag_file(path, merge_lines)
         if tags is None:
@@ -402,13 +415,15 @@ class PromptHelperScript(Script):
             if not tags:
                 _log("正向跳过注入：剥离元数据 tag 后内容为空")
             else:
+                injected = _count_tags(tags)  # 展开前计数 = 编辑器平铺 tag 流的 tag 数
                 tags = expand_breaks(tags, meta)  # BREAK 元数据展开为空行分隔
-                p.prompt = _inject(p.prompt, tags, prepend)
+                p.prompt = _inject(p.prompt, tags)
+                _record_meta_png(p, meta, "fth_meta",
+                                 {"injected_tags": injected, "full_text": p.prompt})
                 if meta is not None:
-                    _record_meta_png(p, meta, "fth_meta")
                     _log(f"正向元数据已剥离并写入 PNG（breaks={meta.get('breaks')}）")
                 shown = tags[:120] + ("…" if len(tags) > 120 else "")
-                _log(f"正向已注入 {len(tags)} 个字符（{message}）：{shown}")
+                _log(f"正向已注入 {injected} 个 tag / {len(tags)} 个字符（{message}）：{shown}")
 
         if _normalize_path(negative_path):
             neg_tags, neg_message = read_tag_file(negative_path, merge_lines)
@@ -420,12 +435,15 @@ class PromptHelperScript(Script):
                 if not neg_tags:
                     _log("反向跳过注入：剥离元数据 tag 后内容为空")
                 else:
+                    neg_injected = _count_tags(neg_tags)
                     neg_tags = expand_breaks(neg_tags, neg_meta)
-                    p.negative_prompt = _inject(p.negative_prompt, neg_tags, prepend)
+                    p.negative_prompt = _inject(p.negative_prompt, neg_tags)
+                    _record_meta_png(p, neg_meta, "fth_meta_negative",
+                                     {"injected_tags": neg_injected,
+                                      "full_text": p.negative_prompt})
                     if neg_meta is not None:
-                        _record_meta_png(p, neg_meta, "fth_meta_negative")
                         _log(f"反向元数据已剥离并写入 PNG（breaks={neg_meta.get('breaks')}）")
-                    _log(f"反向已注入 {len(neg_tags)} 个字符（{neg_message}）")
+                    _log(f"反向已注入 {neg_injected} 个 tag / {len(neg_tags)} 个字符（{neg_message}）")
 
 
 def _on_app_started(demo=None, app=None):

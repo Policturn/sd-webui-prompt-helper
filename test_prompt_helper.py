@@ -78,9 +78,10 @@ ns["CONFIG_PATH"] = os.path.join(tempfile.mkdtemp(), "config.json")
 
 
 class FakeP:
-    prompt = "masterpiece, best quality"
-    negative_prompt = "lowres"
-    extra_generation_params = {}
+    def __init__(self):
+        self.prompt = "masterpiece, best quality"
+        self.negative_prompt = "lowres"
+        self.extra_generation_params = {}
 
 
 def check(label, cond):
@@ -160,7 +161,7 @@ pos, neg, hint = ns["_preview"](r"C:\__no__.txt", NEG_TXT, True)
 check("预览：正向缺失显示错误", pos == "" and "✗ 正向" in hint)
 print(f"  {hint}")
 
-print("== before_process 注入 ==")
+print("== before_process 注入（v1.4.1 起恒定前置）==")
 script = ns["PromptHelperScript"]()
 # 与插件注入管线一致地算期望值（prompt.txt 将来携带元数据 tag 时断言依然成立）
 raw = ns["read_tag_file"](REAL_TXT)[0]
@@ -168,38 +169,45 @@ base, _metas = ns["strip_meta_tags"](raw)
 base = ns["expand_breaks"](base, _metas[-1] if _metas else None)
 
 p = FakeP()
-script.before_process(p, True, REAL_TXT, NEG_TXT, "追加到末尾", True, False, "")
-check("正向追加 + 反向文件注入", p.prompt == "masterpiece, best quality, " + base
-      and p.negative_prompt == "lowres, blurry, bad hands")
-
-p = FakeP()
-script.before_process(p, True, REAL_TXT, NEG_TXT, "插入到最前", True, False, "")
-check("插入到最前（正反向各自生效）", p.prompt == base + ", masterpiece, best quality"
+script.before_process(p, True, REAL_TXT, NEG_TXT, True, False, "")
+check("注入恒在最前（正反向各自生效）", p.prompt == base + ", masterpiece, best quality"
       and p.negative_prompt == "blurry, bad hands, lowres")
 
+recorded = json.loads(p.extra_generation_params.get("fth_meta", "{}"))
+neg_recorded = json.loads(p.extra_generation_params.get("fth_meta_negative", "{}"))
+check("无元数据时也写入注入统计（injected_tags / full_text / plugin）",
+      recorded.get("plugin") == ns["PLUGIN_VERSION"]
+      and recorded.get("injected_tags") == ns["_count_tags"](base)
+      and recorded.get("full_text") == p.prompt
+      and neg_recorded.get("injected_tags") == 2
+      and neg_recorded.get("full_text") == "blurry, bad hands, lowres")
+
 p = FakeP()
-script.before_process(p, True, REAL_TXT, "", "追加到末尾", True, False, "")
-check("反向留空不注入", p.prompt == "masterpiece, best quality, " + base
+script.before_process(p, True, REAL_TXT, "", True, False, "")
+check("反向留空不注入", p.prompt == base + ", masterpiece, best quality"
+      and p.negative_prompt == "lowres"
+      and "fth_meta_negative" not in p.extra_generation_params)
+
+p = FakeP()
+script.before_process(p, True, REAL_TXT, r"C:\__no_neg__.txt", True, False, "")
+check("反向文件缺失时跳过反向", p.prompt == base + ", masterpiece, best quality"
       and p.negative_prompt == "lowres")
 
 p = FakeP()
-script.before_process(p, True, REAL_TXT, r"C:\__no_neg__.txt", "追加到末尾", True, False, "")
-check("反向文件缺失时跳过反向", p.prompt == "masterpiece, best quality, " + base
-      and p.negative_prompt == "lowres")
-
-p = FakeP()
-script.before_process(p, False, REAL_TXT, NEG_TXT, "追加到末尾", True, False, "")
-check("停用时不注入", p.prompt == "masterpiece, best quality" and p.negative_prompt == "lowres")
+script.before_process(p, False, REAL_TXT, NEG_TXT, True, False, "")
+check("停用时不注入", p.prompt == "masterpiece, best quality" and p.negative_prompt == "lowres"
+      and not p.extra_generation_params)
 
 p = FakeP()
 p.prompt = ["a", "b"]
-script.before_process(p, True, REAL_TXT, "", "追加到末尾", True, False, "")
-check("列表提示词逐项注入", p.prompt == ["a, " + base, "b, " + base])
+script.before_process(p, True, REAL_TXT, "", True, False, "")
+check("列表提示词逐项注入", p.prompt == [base + ", a", base + ", b"])
 
 p = FakeP()
-script.before_process(p, True, r"C:\__no_such_file__.txt", NEG_TXT, "追加到末尾", True, False, "")
+script.before_process(p, True, r"C:\__no_such_file__.txt", NEG_TXT, True, False, "")
 check("正向缺失时跳过且反向仍注入", p.prompt == "masterpiece, best quality"
-      and p.negative_prompt == "lowres, blurry, bad hands")
+      and p.negative_prompt == "blurry, bad hands, lowres"
+      and "fth_meta" not in p.extra_generation_params)
 
 os.unlink(NEG_TXT)
 
@@ -212,16 +220,20 @@ with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf
     META_NEG = f.name
 
 p = FakeP()
-script.before_process(p, True, META_TXT, META_NEG, "追加到末尾", True, False, "")
+script.before_process(p, True, META_TXT, META_NEG, True, False, "")
 check("剥离元数据 + BREAK 展开（尾部位置防御性修剪）",
-      p.prompt == "masterpiece, best quality, 1girl, smile\n\ndress, hat"
-      and p.negative_prompt == "lowres, blurry\n\nbad hands"
+      p.prompt == "1girl, smile\n\ndress, hat, masterpiece, best quality"
+      and p.negative_prompt == "blurry\n\nbad hands, lowres"
       and "<fth:meta:" not in p.prompt + p.negative_prompt)
 recorded = json.loads(p.extra_generation_params.get("fth_meta", "{}"))
 neg_recorded = json.loads(p.extra_generation_params.get("fth_meta_negative", "{}"))
-check("元数据写入 PNG extra_generation_params（附插件版本）",
+check("元数据 + 注入统计写入 PNG extra_generation_params（附插件版本）",
       recorded.get("breaks") == [2, 4] and recorded.get("plugin") == ns["PLUGIN_VERSION"]
       and neg_recorded.get("breaks") == [1])
+check("injected_tags 按展开前平铺 tag 流计数（BREAK 不吃掉逗号）",
+      recorded.get("injected_tags") == 4 and neg_recorded.get("injected_tags") == 2
+      and recorded.get("full_text") == p.prompt
+      and neg_recorded.get("full_text") == p.negative_prompt)
 
 os.unlink(META_TXT)
 os.unlink(META_NEG)
@@ -248,11 +260,17 @@ ns["_on_app_started"]()  # 临时配置 autostart 默认关闭，应直接返回
 check("autostart 关闭时启动回调无动作", True)
 
 print("== config 读写 ==")
-ns["_save_config"]({"enabled": False, "path": "X", "negative_path": "N", "position": "插入到最前",
-                     "merge_lines": False, "autostart": True, "editor_path": "Y"})
+ns["_save_config"]({"enabled": False, "path": "X", "negative_path": "N",
+                    "merge_lines": False, "autostart": True, "editor_path": "Y"})
 cfg = ns["_load_config"]()
-check("配置读写往返一致", cfg["position"] == "插入到最前" and cfg["enabled"] is False
+check("配置读写往返一致", cfg["enabled"] is False
       and cfg["merge_lines"] is False and cfg["negative_path"] == "N"
       and cfg["autostart"] is True and cfg["editor_path"] == "Y")
+with open(ns["CONFIG_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"enabled": True, "position": "追加到末尾", "inject_negative": True,
+               "merge_lines": True, "path": "Z"}, f)
+cfg = ns["_load_config"]()
+check("旧版残留键（position 等）被白名单忽略", cfg["enabled"] is True and cfg["path"] == "Z"
+      and "position" not in cfg and "inject_negative" not in cfg)
 
 print("\n全部测试通过 ✔")
