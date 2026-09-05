@@ -4,7 +4,9 @@
 用法：python test_prompt_helper.py
 """
 
+import base64
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -78,6 +80,7 @@ ns["CONFIG_PATH"] = os.path.join(tempfile.mkdtemp(), "config.json")
 class FakeP:
     prompt = "masterpiece, best quality"
     negative_prompt = "lowres"
+    extra_generation_params = {}
 
 
 def check(label, cond):
@@ -112,6 +115,38 @@ os.unlink(empty_path)
 text, msg = ns["read_tag_file"]('  "' + REAL_TXT + '"  ')
 check("路径带引号/空格可容错", text is not None)
 
+
+def _b64url(s):
+    return base64.urlsafe_b64encode(s.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _linked(tags_text, meta):
+    """模拟 FeeTagHelper 构建区的 txt 链路输出：平铺 tag 流 + 末尾元数据 tag。"""
+    return tags_text + ", <fth:meta:" + _b64url(json.dumps(meta, separators=(",", ":"))) + ">"
+
+
+print("== 元数据剥离 / BREAK 展开 ==")
+META = {"v": 1, "breaks": [2], "pick": [{"path": "seg-1", "key": "smile"}]}
+
+clean, metas = ns["strip_meta_tags"](_linked("1girl, smile, dress", META))
+check("元数据 tag 整体剥离", clean == "1girl, smile, dress")
+check("元数据解码为 dict", metas == [META])
+
+clean, metas = ns["strip_meta_tags"]("a, b, c")
+check("无元数据时原样返回", clean == "a, b, c" and metas == [])
+
+clean, metas = ns["strip_meta_tags"]("a, <fth:meta:zzzz>, b")
+check("解码失败静默丢弃整 tag", clean == "a, b" and metas == [])
+
+check("BREAK 展开：第 N 个 tag 后空行分隔",
+      ns["expand_breaks"]("1girl, smile, dress", {"v": 1, "breaks": [2], "pick": []})
+      == "1girl, smile\n\ndress")
+check("BREAK 防御性修剪：首/尾/越界位置忽略",
+      ns["expand_breaks"]("a, b, c", {"v": 1, "breaks": [0, 3, 9], "pick": []}) == "a, b, c")
+check("无 breaks / 无元数据不改动文本",
+      ns["expand_breaks"]("a, b, c", {"v": 1, "pick": []}) == "a, b, c"
+      and ns["expand_breaks"]("a, b", None) == "a, b")
+
 print("== _preview ==")
 with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
     f.write("blurry, bad hands")
@@ -127,7 +162,10 @@ print(f"  {hint}")
 
 print("== before_process 注入 ==")
 script = ns["PromptHelperScript"]()
-base = ns["read_tag_file"](REAL_TXT)[0]
+# 与插件注入管线一致地算期望值（prompt.txt 将来携带元数据 tag 时断言依然成立）
+raw = ns["read_tag_file"](REAL_TXT)[0]
+base, _metas = ns["strip_meta_tags"](raw)
+base = ns["expand_breaks"](base, _metas[-1] if _metas else None)
 
 p = FakeP()
 script.before_process(p, True, REAL_TXT, NEG_TXT, "追加到末尾", True, False, "")
@@ -164,6 +202,29 @@ check("正向缺失时跳过且反向仍注入", p.prompt == "masterpiece, best 
       and p.negative_prompt == "lowres, blurry, bad hands")
 
 os.unlink(NEG_TXT)
+
+print("== before_process 元数据注入管线 ==")
+with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
+    f.write(_linked("1girl, smile, dress, hat", {"v": 1, "breaks": [2, 4], "pick": []}))
+    META_TXT = f.name
+with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
+    f.write(_linked("blurry, bad hands", {"v": 1, "breaks": [1], "pick": [{"path": "g", "key": "blurry"}]}))
+    META_NEG = f.name
+
+p = FakeP()
+script.before_process(p, True, META_TXT, META_NEG, "追加到末尾", True, False, "")
+check("剥离元数据 + BREAK 展开（尾部位置防御性修剪）",
+      p.prompt == "masterpiece, best quality, 1girl, smile\n\ndress, hat"
+      and p.negative_prompt == "lowres, blurry\n\nbad hands"
+      and "<fth:meta:" not in p.prompt + p.negative_prompt)
+recorded = json.loads(p.extra_generation_params.get("fth_meta", "{}"))
+neg_recorded = json.loads(p.extra_generation_params.get("fth_meta_negative", "{}"))
+check("元数据写入 PNG extra_generation_params（附插件版本）",
+      recorded.get("breaks") == [2, 4] and recorded.get("plugin") == ns["PLUGIN_VERSION"]
+      and neg_recorded.get("breaks") == [1])
+
+os.unlink(META_TXT)
+os.unlink(META_NEG)
 
 print("== 编辑器联动启动 ==")
 check("on_app_started 回调已注册", len(_registered_callbacks) >= 1)

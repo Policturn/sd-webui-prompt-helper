@@ -11,13 +11,21 @@
 - 高清修复未单独填写提示词时，自动继承注入后的提示词；
 - 注入结果会写入生成信息 / PNG 元数据，但不会回写到提示词输入框。
 
+FeeTagHelper 构建区可能在 txt 末尾追加元数据 tag（<fth:meta:…>，携带 BREAK
+位置 / 选一记录）。注入前会剥离该 tag（解码失败静默丢弃），按其中的 breaks
+把平铺 tag 流断开为空行分隔（A1111 BREAK 语法），并把解码后的元数据写入
+PNG 的 extra_generation_params（键 fth_meta / fth_meta_negative，附插件版本）。
+
 另提供可选联动：WebUI 启动完成时自动拉起外部词条编辑器（on_app_started
 回调；防重复启动；编辑器作为独立进程运行，关闭 WebUI 不会连带关闭它）。
 """
 
+import base64
+import binascii
 import html
 import json
 import os
+import re
 import subprocess
 import time
 
@@ -27,6 +35,8 @@ from modules.scripts import AlwaysVisible, Script
 
 EXT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(EXT_DIR, "config.json")
+
+PLUGIN_VERSION = "1.4.0"
 
 POSITIONS = ("追加到末尾", "插入到最前")
 CONTROL_KEYS = ("enabled", "path", "negative_path", "position", "merge_lines",
@@ -44,6 +54,10 @@ DEFAULT_CONFIG = {
 
 # 文生图 / 图生图两个页面的组件表，用于设置双向同步
 _TAB_CONTROLS = {}
+
+# FeeTagHelper 构建区元数据 tag：<fth:meta:BASE64URL>（base64url 无填充，字符集不含逗号，
+# 不破坏 tag 流；载荷为紧凑 JSON：v / breaks / pick）。追加在 txt 末尾，注入前剥离。
+META_TAG_RE = re.compile(r"<fth:meta:([A-Za-z0-9_-]+)>")
 
 
 def _log(message):
@@ -121,6 +135,67 @@ def _inject(base, tags, prepend, sep=", "):
     return f"{tags}{sep}{base}" if prepend else f"{base}{sep}{tags}"
 
 
+def _decode_meta_payload(payload):
+    """base64url 解码元数据 tag 载荷。失败返回 None（调用方静默丢弃，不报错不中断）。"""
+    try:
+        padded = payload + "=" * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, binascii.Error):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def strip_meta_tags(text):
+    """剥离词条文本中的 <fth:meta:…> 元数据 tag。返回 (剥离后文本, 元数据列表)。
+
+    元数据 tag 由 FeeTagHelper 构建区追加在 txt 末尾（base64url 编码的紧凑
+    JSON，字段 v / breaks / pick）。无论解码是否成功，整个 tag 都被移除、
+    不进入生成用提示词；解码失败的 tag 静默丢弃，不报错不中断。
+    文本不含元数据 tag 时原样返回（分隔符不动）。
+    """
+    if not text or "<fth:meta:" not in text:
+        return text, []
+
+    metas = []
+
+    def _take(match):
+        meta = _decode_meta_payload(match.group(1))
+        if meta is not None:
+            metas.append(meta)
+        return ""  # 解码失败的 tag 同样整个移除
+
+    kept = []
+    for chunk in text.split(","):
+        chunk = META_TAG_RE.sub(_take, chunk).strip()
+        if chunk:
+            kept.append(chunk)
+    return ", ".join(kept), metas
+
+
+def expand_breaks(text, meta):
+    """按元数据 breaks 在平铺 tag 流中插入 BREAK（A1111 语法：空行分隔）。
+
+    breaks 语义：N = BREAK 前面的 tag 数，即在第 N 个 tag 之后断开；元数据
+    tag 已被 strip_meta_tags 移除、不参与计数。越界（N ≤ 0 或 N ≥ tag 总数）
+    与重复位置静默忽略——编辑器侧已修剪首尾/连续 BREAK，此处防御性再修剪。
+    """
+    if not isinstance(meta, dict):
+        return text
+    raw = meta.get("breaks")
+    if not isinstance(raw, list) or not raw:
+        return text
+    tags = [t for t in (x.strip() for x in text.split(",")) if t]
+    positions = sorted({n for n in raw if isinstance(n, int) and 0 < n < len(tags)})
+    if not positions:
+        return text
+    segments, start = [], 0
+    for n in positions:
+        segments.append(", ".join(tags[start:n]))
+        start = n
+    segments.append(", ".join(tags[start:]))
+    return "\n\n".join(segments)
+
+
 def _is_process_running(exe_name):
     """查询同名进程是否已在运行（用于防止编辑器被重复拉起）。"""
     exe_name = exe_name.lower()
@@ -173,6 +248,16 @@ def _file_hint(path, text):
     return f"文件正常 · {tag_count} 个词条 · 文件更新于 {updated}"
 
 
+def _record_meta_png(p, meta, key):
+    """把剥离出的元数据（附插件版本号）写进 PNG 生成信息：参数面板可见、读图可还原。"""
+    try:
+        recorded = dict(meta)
+        recorded["plugin"] = PLUGIN_VERSION
+        p.extra_generation_params[key] = json.dumps(recorded, ensure_ascii=False)
+    except (AttributeError, TypeError, ValueError):
+        pass  # 记录失败不影响生成
+
+
 def _preview(path, negative_path, merge_lines):
     parts = []
 
@@ -181,8 +266,10 @@ def _preview(path, negative_path, merge_lines):
         pos_preview = ""
         parts.append(f"<span style='color:#e5484d'>✗ 正向：{html.escape(message)}</span>")
     else:
+        text, metas = strip_meta_tags(text)
         pos_preview = text
-        parts.append(f"<span style='color:#30a46c'>✓ 正向：{_file_hint(path, text)}</span>")
+        meta_hint = " · 携带元数据" if metas else ""
+        parts.append(f"<span style='color:#30a46c'>✓ 正向：{_file_hint(path, text)}{meta_hint}</span>")
 
     neg_preview = ""
     if _normalize_path(negative_path):
@@ -190,8 +277,10 @@ def _preview(path, negative_path, merge_lines):
         if neg_text is None:
             parts.append(f"<span style='color:#e5484d'>✗ 反向：{html.escape(neg_message)}</span>")
         else:
+            neg_text, neg_metas = strip_meta_tags(neg_text)
             neg_preview = neg_text
-            parts.append(f"<span style='color:#30a46c'>✓ 反向：{_file_hint(negative_path, neg_text)}</span>")
+            meta_hint = " · 携带元数据" if neg_metas else ""
+            parts.append(f"<span style='color:#30a46c'>✓ 反向：{_file_hint(negative_path, neg_text)}{meta_hint}</span>")
     else:
         parts.append("<span style='color:#888'>反向：未设置（留空则不注入）</span>")
 
@@ -308,17 +397,35 @@ class PromptHelperScript(Script):
         if tags is None:
             _log(f"正向跳过注入：{message}")
         else:
-            p.prompt = _inject(p.prompt, tags, prepend)
-            shown = tags[:120] + ("…" if len(tags) > 120 else "")
-            _log(f"正向已注入 {len(tags)} 个字符（{message}）：{shown}")
+            tags, metas = strip_meta_tags(tags)
+            meta = metas[-1] if metas else None
+            if not tags:
+                _log("正向跳过注入：剥离元数据 tag 后内容为空")
+            else:
+                tags = expand_breaks(tags, meta)  # BREAK 元数据展开为空行分隔
+                p.prompt = _inject(p.prompt, tags, prepend)
+                if meta is not None:
+                    _record_meta_png(p, meta, "fth_meta")
+                    _log(f"正向元数据已剥离并写入 PNG（breaks={meta.get('breaks')}）")
+                shown = tags[:120] + ("…" if len(tags) > 120 else "")
+                _log(f"正向已注入 {len(tags)} 个字符（{message}）：{shown}")
 
         if _normalize_path(negative_path):
             neg_tags, neg_message = read_tag_file(negative_path, merge_lines)
             if neg_tags is None:
                 _log(f"反向跳过注入：{neg_message}")
             else:
-                p.negative_prompt = _inject(p.negative_prompt, neg_tags, prepend)
-                _log(f"反向已注入 {len(neg_tags)} 个字符（{neg_message}）")
+                neg_tags, neg_metas = strip_meta_tags(neg_tags)
+                neg_meta = neg_metas[-1] if neg_metas else None
+                if not neg_tags:
+                    _log("反向跳过注入：剥离元数据 tag 后内容为空")
+                else:
+                    neg_tags = expand_breaks(neg_tags, neg_meta)
+                    p.negative_prompt = _inject(p.negative_prompt, neg_tags, prepend)
+                    if neg_meta is not None:
+                        _record_meta_png(p, neg_meta, "fth_meta_negative")
+                        _log(f"反向元数据已剥离并写入 PNG（breaks={neg_meta.get('breaks')}）")
+                    _log(f"反向已注入 {len(neg_tags)} 个字符（{neg_message}）")
 
 
 def _on_app_started(demo=None, app=None):

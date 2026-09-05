@@ -45,6 +45,22 @@ git clone https://github.com/Policturn/sd-webui-prompt-helper extensions/sd-webu
 - 与"样式 (Styles)"的关系：注入先于样式应用，词条会作为基础提示词参与样式模板。
 - 控制台日志前缀为 `[prompt-helper]`，注入 / 跳过都会打印原因。
 
+## FeeTagHelper 元数据 tag（v1.4.0+）
+
+FeeTagHelper 构建区开启"携带元数据"时，txt 末尾会追加一个
+`<fth:meta:BASE64URL>` tag（携带 BREAK 分组位置 / 选一记录）。插件注入时会：
+
+1. **剥离**该 tag——无论解码是否成功，它都不会进入生成用提示词
+   （解码失败静默丢弃，不报错不中断）；
+2. **展开 BREAK**——按元数据中的 `breaks` 位置把平铺 tag 流断开为
+   **空行分隔**（A1111 BREAK 语法），还原编辑器里的分组结构；首尾 / 连续
+   BREAK 已在编辑器侧修剪，插件侧防御性再修剪一次；
+3. **写入 PNG**——解码后的元数据（附插件版本号）写进生成信息的
+   `extra_generation_params`（键 `fth_meta` / `fth_meta_negative`），
+   PNG 参数面板可见、读图可还原。
+
+不需要该行为时，在 FeeTagHelper 设置里关闭"携带元数据"即可（txt 恢复纯平铺）。
+
 ## 常见问题
 
 - **路径怎么填**：资源管理器里选中文件，Shift + 右键 → "复制文件地址"，粘贴进来即可。
