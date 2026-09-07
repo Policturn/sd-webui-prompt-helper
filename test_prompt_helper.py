@@ -95,8 +95,9 @@ class FakeP:
 
 
 class FakeProcessed:
-    def __init__(self, images):
+    def __init__(self, images, info="Steps: 24"):
         self.images = images
+        self.info = info
 
 
 def check(label, cond):
@@ -350,9 +351,11 @@ os.makedirs(ns["FEETAG_OUT_DIR"], exist_ok=True)
 class FakeImage:
     def __init__(self):
         self.save_paths = []
+        self.save_kwargs = []
 
-    def save(self, path):
+    def save(self, path, **kwargs):
         self.save_paths.append(path)
+        self.save_kwargs.append(kwargs)
         with open(path, "wb") as f:  # 真实落盘，postprocess 才能通过 listdir 断言
             f.write(b"png")
 
@@ -378,11 +381,17 @@ saved = sorted(os.listdir(ns["FEETAG_OUT_DIR"]))
 check("postprocess：全部落盘 fth_ 时间戳命名", len(saved) == 3
       and all(name.startswith("fth_") and name.endswith(".png") for name in saved)
       and [img.save_paths[0] for img in imgs] == [os.path.join(ns["FEETAG_OUT_DIR"], n) for n in saved])
+check("postprocess：生成信息以 pnginfo 传递给 save",
+      all(img.save_kwargs and img.save_kwargs[0].get("pnginfo") is not None for img in imgs))
 with open(ns["STATUS_PATH"], encoding="utf-8") as f:
     final = json.load(f)
 check("postprocess：状态 done + 绝对路径清单", final["state"] == "done"
       and final["images"] == [os.path.join(ns["FEETAG_OUT_DIR"], n) for n in saved]
       and final["pass"] == before_pass + 1)
+img_noinfo = FakeImage()
+script.postprocess(gen_p, FakeProcessed([img_noinfo], info=None))
+check("postprocess：无生成信息时退回裸 save（不传 pnginfo）",
+      img_noinfo.save_kwargs == [{}])
 
 print("== 编辑器联动启动 ==")
 check("on_app_started 回调已注册", len(_registered_callbacks) >= 1)

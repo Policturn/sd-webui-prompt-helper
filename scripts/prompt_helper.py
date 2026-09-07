@@ -674,10 +674,23 @@ class PromptHelperScript(Script):
             os.makedirs(FEETAG_OUT_DIR, exist_ok=True)
             stamp = time.strftime("%Y%m%d_%H%M%S") + f"{int(time.time() * 1000) % 1000:03d}"
             saved = []
+            # 把生成信息（parameters）写进回传副本，编辑器拿到的图自证参数
+            geninfo = getattr(processed, "info", None)
+            pnginfo = None
+            if isinstance(geninfo, str) and geninfo:
+                try:
+                    from PIL import PngImagePlugin
+                    pnginfo = PngImagePlugin.PngInfo()
+                    pnginfo.add_text("parameters", geninfo)
+                except Exception:
+                    pnginfo = None
             for i, image in enumerate(list(processed.images or [])):
                 path = os.path.join(FEETAG_OUT_DIR, f"fth_{stamp}_{i}.png")
                 try:
-                    image.save(path)
+                    if pnginfo is not None:
+                        image.save(path, pnginfo=pnginfo)
+                    else:
+                        image.save(path)
                     saved.append(path)
                 except (AttributeError, OSError, ValueError) as e:
                     _log(f"回传图片 {i} 失败：{e}")
