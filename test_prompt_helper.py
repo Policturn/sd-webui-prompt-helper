@@ -77,13 +77,16 @@ spec.loader.exec_module(mod)
 ns = mod.__dict__
 
 # before_process 会把参数写回配置文件，测试期间改用临时配置，避免污染真实配置；
-# 总线文件（status/params/cmd/featag_out）同理重定向到临时目录
+# 总线文件（status/params/cmd/featag_out/bus.armed）同理重定向到临时目录，
+# 并放置 bus.armed 使总线处于启用态（与未启用态的行为差异另有专项用例）
 TMP_DIR = tempfile.mkdtemp()
 ns["CONFIG_PATH"] = os.path.join(TMP_DIR, "config.json")
 ns["PARAMS_PATH"] = os.path.join(TMP_DIR, "params.json")
 ns["CMD_PATH"] = os.path.join(TMP_DIR, "cmd.json")
 ns["STATUS_PATH"] = os.path.join(TMP_DIR, "status.json")
 ns["FEETAG_OUT_DIR"] = os.path.join(TMP_DIR, "featag_out")
+ns["ARMED_PATH"] = os.path.join(TMP_DIR, "bus.armed")
+open(ns["ARMED_PATH"], "w").close()
 ns["_status_snapshot"] = None
 
 
@@ -392,6 +395,28 @@ img_noinfo = FakeImage()
 script.postprocess(gen_p, FakeProcessed([img_noinfo], info=None))
 check("postprocess：无生成信息时退回裸 save（不传 pnginfo）",
       img_noinfo.save_kwargs == [{}])
+
+print("== 总线总开关 bus.armed（v1.4.3 默认关）==")
+os.remove(ns["ARMED_PATH"])  # 拆除开关 → 总线全关
+before_pass = ns["_gen_pass"]
+before_status_mtime = os.stat(ns["STATUS_PATH"]).st_mtime_ns
+before_img_count = len(os.listdir(ns["FEETAG_OUT_DIR"]))
+p_dis = FakeP()
+script.before_process(p_dis, True, REAL_TXT, "", True, False, "")
+check("开关关：注入照常工作", p_dis.prompt.startswith(base + ", masterpiece"))
+check("开关关：不写状态不计数", ns["_gen_pass"] == before_pass
+      and os.stat(ns["STATUS_PATH"]).st_mtime_ns == before_status_mtime)
+script.postprocess(p_dis, FakeProcessed([FakeImage()]))
+check("开关关：不回传不落图", len(os.listdir(ns["FEETAG_OUT_DIR"])) == before_img_count
+      and os.stat(ns["STATUS_PATH"]).st_mtime_ns == before_status_mtime)
+targets_off = [("base", "width", FakeComp(minimum=64, maximum=2048), "slider_int")]
+handler_off = ns["_make_apply_handler"](targets_off)
+check("开关关：apply 全部 no-op", handler_off() == [{"__type__": "update"}])
+open(ns["ARMED_PATH"], "w").close()  # 重新放回开关 → 即刻生效（无需重启语义）
+ns["_gen_pass"] = before_pass + 1
+ns["_write_status"]("idle")
+check("开关开：重新放置即恢复", json.load(open(ns["STATUS_PATH"], encoding="utf-8"))["pass"] == before_pass + 1)
+check("bus_armed 现查", ns["bus_armed"]() is True)
 
 print("== 编辑器联动启动 ==")
 check("on_app_started 回调已注册", len(_registered_callbacks) >= 1)

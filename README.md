@@ -85,7 +85,7 @@ FeeTagHelper 构建区开启"携带元数据"时，txt 末尾会追加一个
 （块数 / 末块 token 数 / 是否截断），故不回传 `chunks` / `clipped`——编辑器
 端用自带 tokenizer 依据 `full_text` 自行计算，对齐由 tokenizer 本身保证。
 
-## 生成页总线（v1.4.2+，P1）
+## 生成页总线（v1.4.2+，P1；v1.4.3 起带总开关）
 
 本插件同时是 FeeTagHelper「生成」页的服务端：编辑器把要覆盖的参数与触发指令
 写进**插件目录**（与 config.json 同层），浏览器端 `javascript/feetag_generate.js`
@@ -105,8 +105,14 @@ FeeTagHelper 构建区开启"携带元数据"时，txt 末尾会追加一个
 （hr_checkpoint 中途换模型暂不接）。ADetailer 等扩展的内部重绘 pass
 （`_ad_inner` 标记）在插件所有钩子入口直接跳过——不注入词条、不计数、不回传。
 
+### 总开关：bus.armed（v1.4.3+）
+
+总线**默认关闭**：在插件目录放置一个空的 `bus.armed` 文件才启用全部总线行为
+（JS 轮询 / status 写入 / featag_out 回传 / 参数回填）；删除该文件即关闭。
+放置/删除**即刻生效，无需重启 WebUI**。词条注入（本插件核心功能）与开关无关、始终可用。
+
 以上总线文件均已被 .gitignore 排除；删除即完全复位（status.json 会在下次启动
-WebUI 时重新生成）。
+WebUI 且开关开启时重新生成）。
 
 ## 常见问题
 

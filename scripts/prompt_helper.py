@@ -36,6 +36,10 @@ postprocess 把成品图存 featag_out/（毫秒时间戳命名）并置 done；
 pass（_ad_inner 标记）在所有钩子入口直接 return，不注入不计数不回传。
 status.json（state/pass/images/error/ts + choices）只在内容变化时重写，
 供编辑器轮询；params/cmd 的读取仅在 apply 点击时发生，天然节流。
+
+v1.4.3 起总线带总开关：插件目录放置 bus.armed 标志文件才启用全部总线行为
+（JS 轮询 / status 写入 / featag_out 回传 / apply 回填），默认关闭——词条注入
+不受开关影响。放置/删除即刻生效，无需重启。
 """
 
 import base64
@@ -60,8 +64,11 @@ PARAMS_PATH = os.path.join(EXT_DIR, "params.json")
 CMD_PATH = os.path.join(EXT_DIR, "cmd.json")
 STATUS_PATH = os.path.join(EXT_DIR, "status.json")
 FEETAG_OUT_DIR = os.path.join(EXT_DIR, "featag_out")
+# 总开关（v1.4.3）：bus.armed 存在才启用总线（status/featag_out/apply 回填/JS 轮询）。
+# 默认关闭——词条注入（本插件核心功能）不受影响；排查期防止任何总线副作用。
+ARMED_PATH = os.path.join(EXT_DIR, "bus.armed")
 
-PLUGIN_VERSION = "1.4.2"
+PLUGIN_VERSION = "1.4.3"
 
 CONTROL_KEYS = ("enabled", "path", "negative_path", "merge_lines",
                 "autostart", "editor_path")
@@ -132,6 +139,12 @@ _UI_COMPONENTS = {}
 _status_lock = threading.Lock()
 _status_snapshot = None
 _gen_pass = 0
+
+
+def bus_armed():
+    """总线总开关：bus.armed 标志文件存在 = 启用。每次现查（一次 stat，代价可忽略），
+    放置/删除文件即刻生效，无需重启 WebUI。"""
+    return os.path.isfile(ARMED_PATH)
 
 
 def _read_bus_json(path):
@@ -219,6 +232,8 @@ def _make_apply_handler(targets):
     """生成页隐藏 apply 钮的处理函数：读 params.json，按 targets（闭包含组件引用）
     产出 gr.update 列表。键不出现 / 显式 null / 值非法 → 原样 gr.update() 不覆盖。"""
     def handler():
+        if not bus_armed():
+            return [gr.update() for _ in targets]  # 总开关关闭：回填全部 no-op
         params = _read_bus_json(PARAMS_PATH)
         params = params if isinstance(params, dict) else {}
         updates, applied, skipped = [], [], []
@@ -616,8 +631,9 @@ class PromptHelperScript(Script):
         if getattr(p, "_ad_inner", False):
             return  # ADetailer 内部 pass：不注入不计数不写状态（防御行）
         global _gen_pass
-        _gen_pass += 1
-        _write_status("busy")
+        if bus_armed():
+            _gen_pass += 1
+            _write_status("busy")
         _save_config(dict(zip(CONTROL_KEYS, (enabled, path, negative_path,
                                               merge_lines, autostart, editor_path))))
         if not enabled:
@@ -666,9 +682,10 @@ class PromptHelperScript(Script):
         """生成完成：成品图复制到 featag_out/（毫秒时间戳命名）并置状态 done。
 
         ADetailer 内部 pass 走不到这里（脚本白名单已隔离），此处再防御一次。
+        总开关关闭时整段跳过（不落图不写状态）。
         任何异常只置 error 状态 + 打日志，绝不影响生成任务本身。
         """
-        if getattr(p, "_ad_inner", False):
+        if getattr(p, "_ad_inner", False) or not bus_armed():
             return
         try:
             os.makedirs(FEETAG_OUT_DIR, exist_ok=True)
@@ -705,11 +722,12 @@ class PromptHelperScript(Script):
 
 
 def _on_app_started(demo=None, app=None):
-    try:
-        os.makedirs(FEETAG_OUT_DIR, exist_ok=True)
-    except OSError:
-        pass
-    _write_status("idle")  # 启动即发初态（含 choices），编辑器据此判断插件在线
+    if bus_armed():
+        try:
+            os.makedirs(FEETAG_OUT_DIR, exist_ok=True)
+        except OSError:
+            pass
+        _write_status("idle")  # 总线启用时发初态（含 choices），编辑器据此判断插件在线
     cfg = _load_config()
     if not cfg["autostart"]:
         return
