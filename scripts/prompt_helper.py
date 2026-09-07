@@ -68,7 +68,7 @@ FEETAG_OUT_DIR = os.path.join(EXT_DIR, "featag_out")
 # 默认关闭——词条注入（本插件核心功能）不受影响；排查期防止任何总线副作用。
 ARMED_PATH = os.path.join(EXT_DIR, "bus.armed")
 
-PLUGIN_VERSION = "1.4.3"
+PLUGIN_VERSION = "1.4.4"
 
 CONTROL_KEYS = ("enabled", "path", "negative_path", "merge_lines",
                 "autostart", "editor_path")
@@ -721,7 +721,50 @@ class PromptHelperScript(Script):
                 pass
 
 
+def _register_bus_endpoints(app):
+    """注册总线只读端点（v1.4.4）：
+      GET /feetag/bus/status         → status.json 内容（application/json）
+      GET /feetag/bus/image?name=xx  → featag_out/<name>（basename 防穿越）
+    两者都带 Access-Control-Allow-Origin: *——编辑器面板（Tauri webview 的
+    tauri.localhost 源 / dev 的 localhost:5173 源）跨源读取 /file= 会被 CORS
+    拦截（gradio 的 CORS 只放行本机同名源），自有端点解决之。
+    路由注册无条件（保证"放置 bus.armed 即生效"），内容按 bus_armed() 门控：
+    未启用时一律 404，与总线默认关语义一致。"""
+    try:
+        from fastapi.responses import FileResponse, Response
+    except Exception as e:  # fastapi 理论上必在（gradio 依赖）；防御性兜底
+        _log(f"总线端点未注册（fastapi 导入失败）：{e}")
+        return
+
+    def _bus_status():
+        if not bus_armed():
+            return Response(status_code=404)
+        try:
+            with open(STATUS_PATH, "rb") as f:
+                return Response(content=f.read(), media_type="application/json",
+                                headers={"Access-Control-Allow-Origin": "*"})
+        except OSError:
+            return Response(status_code=404)
+
+    def _bus_image(name: str = ""):
+        if not bus_armed():
+            return Response(status_code=404)
+        path = os.path.join(FEETAG_OUT_DIR, os.path.basename(name or ""))
+        if not os.path.isfile(path):
+            return Response(status_code=404)
+        return FileResponse(path, headers={"Access-Control-Allow-Origin": "*"})
+
+    try:
+        app.add_api_route("/feetag/bus/status", _bus_status, methods=["GET"], include_in_schema=False)
+        app.add_api_route("/feetag/bus/image", _bus_image, methods=["GET"], include_in_schema=False)
+        _log("总线端点已注册：GET /feetag/bus/status、/feetag/bus/image（bus.armed 门控）")
+    except Exception as e:
+        _log(f"总线端点注册失败（不影响其他功能）：{e}")
+
+
 def _on_app_started(demo=None, app=None):
+    if app is not None:
+        _register_bus_endpoints(app)
     if bus_armed():
         try:
             os.makedirs(FEETAG_OUT_DIR, exist_ok=True)
