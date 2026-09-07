@@ -26,6 +26,16 @@ full_text 自行计算分块对齐。
 
 另提供可选联动：WebUI 启动完成时自动拉起外部词条编辑器（on_app_started
 回调；防重复启动；编辑器作为独立进程运行，关闭 WebUI 不会连带关闭它）。
+
+v1.4.2 起提供「生成」页总线（P1，生成页-实施设计.md）：编辑器把 params.json
+（要覆盖的参数）与 cmd.json（触发指令）写进本插件目录，javascript/feetag_generate.js
+轮询 cmd.json，点隐藏 apply 钮让服务端读 params.json 并以 gr.update 回填界面组件
+（语义键 → elem_id 选择器表见 _FIELD_TABLES，组件经 on_after_component 捕获），
+再由 JS 切页签点生成钮走 UI 队列。每次生成 before_process 置状态 busy、
+postprocess 把成品图存 featag_out/（毫秒时间戳命名）并置 done；ADetailer 内部
+pass（_ad_inner 标记）在所有钩子入口直接 return，不注入不计数不回传。
+status.json（state/pass/images/error/ts + choices）只在内容变化时重写，
+供编辑器轮询；params/cmd 的读取仅在 apply 点击时发生，天然节流。
 """
 
 import base64
@@ -35,6 +45,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 
 import gradio as gr
@@ -44,7 +55,13 @@ from modules.scripts import AlwaysVisible, Script
 EXT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(EXT_DIR, "config.json")
 
-PLUGIN_VERSION = "1.4.1"
+# 生成页总线文件（编辑器直写 / 浏览器 JS 经 /file= 读取，均在插件目录内）
+PARAMS_PATH = os.path.join(EXT_DIR, "params.json")
+CMD_PATH = os.path.join(EXT_DIR, "cmd.json")
+STATUS_PATH = os.path.join(EXT_DIR, "status.json")
+FEETAG_OUT_DIR = os.path.join(EXT_DIR, "featag_out")
+
+PLUGIN_VERSION = "1.4.2"
 
 CONTROL_KEYS = ("enabled", "path", "negative_path", "merge_lines",
                 "autostart", "editor_path")
@@ -64,6 +81,182 @@ _TAB_CONTROLS = {}
 # FeeTagHelper 构建区元数据 tag：<fth:meta:BASE64URL>（base64url 无填充，字符集不含逗号，
 # 不破坏 tag 流；载荷为紧凑 JSON：v / breaks / pick）。追加在 txt 末尾，注入前剥离。
 META_TAG_RE = re.compile(r"<fth:meta:([A-Za-z0-9_-]+)>")
+
+# ---------------------------------------------------------------------------
+# 生成页总线（v1.4.2，P1）
+# ---------------------------------------------------------------------------
+
+_MISSING = object()  # params.json 中未出现的键：不覆盖（与 None 显式"保持现状"同义）
+
+# 语义键 → elem_id 选择器表。elem_id 逐一对照 H 盘 A1111 1.10.1 源码核实：
+# 常规参数在 modules/ui.py；采样/调度/步数由内置脚本 modules/processing_scripts/sampler.py
+# 以 f"{tab}_sampling" 等生成；种子为内置 Seed 脚本 f"{tab}_seed"（gr.Number）；
+# hires 组件 elem_id 见 modules/ui.py L311-339，其中 InputAccordion 的真实取值
+# 组件是隐藏 checkbox（elem_id = "txt2img_hr" + "-checkbox"）。
+_BASE_FIELDS = [
+    ("width", "width", "slider_int"),
+    ("height", "height", "slider_int"),
+    ("seed", "seed", "number"),
+    ("sampler_name", "sampling", "dropdown"),
+    ("scheduler", "scheduler", "dropdown"),
+    ("steps", "steps", "slider_int"),
+    ("cfg_scale", "cfg_scale", "slider_float"),
+    ("batch_size", "batch_size", "slider_int"),
+    ("n_iter", "batch_count", "slider_int"),
+]
+_HIRES_FIELDS = [  # hires 仅文生图；hr_checkpoint（中途换模型）按论证结论 v1 不接
+    ("enable", "txt2img_hr-checkbox", "checkbox"),
+    ("upscaler", "txt2img_hr_upscaler", "dropdown"),
+    ("hr_scale", "txt2img_hr_scale", "slider_float"),
+    ("steps", "txt2img_hires_steps", "slider_int"),
+    ("denoise", "txt2img_denoising_strength", "slider_float"),
+]
+
+
+def _field_table(is_img2img):
+    """某页的可覆盖字段表：[(总线分区, 语义键, elem_id, 组件类型)]。"""
+    tab = "img2img" if is_img2img else "txt2img"
+    table = [("base", key, f"{tab}_{elem}", kind) for key, elem, kind in _BASE_FIELDS]
+    if not is_img2img:
+        table += [("hires", key, elem, kind) for key, elem, kind in _HIRES_FIELDS]
+    return table
+
+
+_FIELD_TABLES = {False: _field_table(False), True: _field_table(True)}
+_WANTED_ELEM_IDS = {row[2] for rows in _FIELD_TABLES.values() for row in rows}
+
+# on_after_component 捕获到的页面组件（elem_id -> gradio 组件）
+_UI_COMPONENTS = {}
+
+# status.json 写入去重（内容未变化不重写）+ 生成计数
+_status_lock = threading.Lock()
+_status_snapshot = None
+_gen_pass = 0
+
+
+def _read_bus_json(path):
+    """读总线 JSON 文件（params/cmd）。缺失 / 损坏 / 正被写入时返回 None，不抛错。"""
+    for attempt in range(2):  # 编辑器写文件的一瞬可能读到半个 JSON，短暂重试一次
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            if attempt == 0:
+                time.sleep(0.1)
+    return None
+
+
+def _publish_choices():
+    """把 WebUI 当前实际可用的采样器 / 调度 / 超分 choices 发给客户端，
+    编辑器下拉据此渲染，避免填入 WebUI 里不存在的值。离线 / mock 环境返回 {}。"""
+    try:
+        from modules import sd_samplers, sd_schedulers, shared
+        return {
+            "samplers": [x.name for x in sd_samplers.visible_samplers()],
+            "schedulers": [x.label for x in sd_schedulers.schedulers],
+            "upscalers": [x.name for x in shared.sd_upscalers],
+        }
+    except Exception:
+        return {}
+
+
+def _write_status(state, images=None, error=None):
+    """写 status.json（state/pass/images/error/ts + choices）。
+
+    内容签名（state/pass/images/error/choices）未变化时不重写——客户端高频轮询
+    的只是不再变化的文件，磁盘零增长；ts 仅在真实写入时刷新。
+    任何写入异常只打日志，绝不影响生成。
+    """
+    global _status_snapshot
+    choices = _publish_choices()
+    signature = json.dumps([state, _gen_pass, list(images or []), error, choices],
+                           ensure_ascii=False, default=str)
+    with _status_lock:
+        if signature == _status_snapshot:
+            return
+        payload = {
+            "state": state,
+            "pass": _gen_pass,
+            "images": list(images or []),
+            "error": error,
+            "ts": int(time.time() * 1000),
+            "plugin": PLUGIN_VERSION,
+            "choices": choices,
+        }
+        try:
+            with open(STATUS_PATH, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            _status_snapshot = signature
+        except OSError as e:
+            _log(f"status.json 写入失败：{e}")
+
+
+def _coerce_value(kind, value, comp):
+    """把 params.json 里的原始值整理成组件可接受的值。越界夹取、
+    下拉 choices 不含该值时返回 None（调用方跳过，防止 gradio 拒值）。"""
+    if kind == "checkbox":
+        return bool(value)
+    if kind == "number":
+        return int(float(value))
+    if kind in ("slider_int", "slider_float"):
+        num = float(value)
+        minimum = getattr(comp, "minimum", None)
+        maximum = getattr(comp, "maximum", None)
+        if isinstance(minimum, (int, float)):
+            num = max(minimum, num)
+        if isinstance(maximum, (int, float)):
+            num = min(maximum, num)
+        return int(num) if kind == "slider_int" else round(num, 4)
+    text = str(value)
+    if kind == "dropdown":
+        choices = list(getattr(comp, "choices", None) or [])
+        if choices and text not in choices:
+            return None
+    return text
+
+
+def _make_apply_handler(targets):
+    """生成页隐藏 apply 钮的处理函数：读 params.json，按 targets（闭包含组件引用）
+    产出 gr.update 列表。键不出现 / 显式 null / 值非法 → 原样 gr.update() 不覆盖。"""
+    def handler():
+        params = _read_bus_json(PARAMS_PATH)
+        params = params if isinstance(params, dict) else {}
+        updates, applied, skipped = [], [], []
+        for section, key, comp, kind in targets:
+            section_data = params.get(section)
+            value = _MISSING
+            if isinstance(section_data, dict) and key in section_data:
+                value = section_data[key]
+            if value is _MISSING or value is None:
+                updates.append(gr.update())
+                continue
+            try:
+                coerced = _coerce_value(kind, value, comp)
+            except (TypeError, ValueError):
+                coerced = None
+            if coerced is None:
+                updates.append(gr.update())
+                skipped.append(f"{section}.{key}={value!r}")
+                continue
+            updates.append(gr.update(value=coerced))
+            applied.append(f"{section}.{key}={coerced}")
+        if applied or skipped:
+            message = f"参数应用：{', '.join(applied)}" if applied else "参数应用：无生效键"
+            if skipped:
+                message += f"（跳过：{', '.join(skipped)}）"
+            _log(message)
+        return updates
+    return handler
+
+
+def _on_after_component(component, **kwargs):
+    """捕获生成页参数组件（elem_id 在选择器表内的），供 apply 事件作 outputs。"""
+    try:
+        elem_id = getattr(component, "elem_id", None)
+        if elem_id in _WANTED_ELEM_IDS:
+            _UI_COMPONENTS[elem_id] = component
+    except Exception:
+        pass
 
 
 def _log(message):
@@ -387,6 +580,25 @@ class PromptHelperScript(Script):
                              outputs=[preview, negative_preview, status])
         launch_button.click(fn=_launch_click, inputs=[editor_path], outputs=[launch_status])
 
+        # 生成页总线：隐藏 apply 钮。JS 轮询到 cmd.json 后先点它（服务端读
+        # params.json → gr.update 回填界面组件，未捕获/缺失的组件自动跳过），
+        # 稍候再点该页生成钮，走 UI 正常队列。visible=False 的 Button 仍在 DOM
+        # 中可被 JS 点击（A1111 自家 img2img_update_resize_to 同款用法）。
+        tab = "img2img" if is_img2img else "txt2img"
+        targets = [(section, key, _UI_COMPONENTS[elem_id], kind)
+                   for section, key, elem_id, kind in _FIELD_TABLES[is_img2img]
+                   if elem_id in _UI_COMPONENTS]
+        missing = [row[2] for row in _FIELD_TABLES[is_img2img]
+                   if row[2] not in _UI_COMPONENTS]
+        if missing:
+            _log(f"生成页（{tab}）未捕获组件：{', '.join(missing)}（对应参数将跳过）")
+        apply_button = gr.Button(value="feetag-apply", visible=False,
+                                 elem_id=f"feetag_apply_{tab}")
+        if targets:
+            apply_button.click(fn=_make_apply_handler(targets), inputs=[],
+                               outputs=[row[2] for row in targets],
+                               show_progress=False, queue=False)
+
         controls = {
             "enabled": enabled,
             "path": path,
@@ -401,6 +613,11 @@ class PromptHelperScript(Script):
 
     def before_process(self, p, enabled, path, negative_path, merge_lines, autostart, editor_path):
         """每次生成任务触发一次，早于提示词列表构建，改 p.prompt 即可全量生效。"""
+        if getattr(p, "_ad_inner", False):
+            return  # ADetailer 内部 pass：不注入不计数不写状态（防御行）
+        global _gen_pass
+        _gen_pass += 1
+        _write_status("busy")
         _save_config(dict(zip(CONTROL_KEYS, (enabled, path, negative_path,
                                               merge_lines, autostart, editor_path))))
         if not enabled:
@@ -445,8 +662,41 @@ class PromptHelperScript(Script):
                         _log(f"反向元数据已剥离并写入 PNG（breaks={neg_meta.get('breaks')}）")
                     _log(f"反向已注入 {neg_injected} 个 tag / {len(neg_tags)} 个字符（{neg_message}）")
 
+    def postprocess(self, p, processed, *args):
+        """生成完成：成品图复制到 featag_out/（毫秒时间戳命名）并置状态 done。
+
+        ADetailer 内部 pass 走不到这里（脚本白名单已隔离），此处再防御一次。
+        任何异常只置 error 状态 + 打日志，绝不影响生成任务本身。
+        """
+        if getattr(p, "_ad_inner", False):
+            return
+        try:
+            os.makedirs(FEETAG_OUT_DIR, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S") + f"{int(time.time() * 1000) % 1000:03d}"
+            saved = []
+            for i, image in enumerate(list(processed.images or [])):
+                path = os.path.join(FEETAG_OUT_DIR, f"fth_{stamp}_{i}.png")
+                try:
+                    image.save(path)
+                    saved.append(path)
+                except (AttributeError, OSError, ValueError) as e:
+                    _log(f"回传图片 {i} 失败：{e}")
+            _write_status("done", images=saved)
+            _log(f"已回传 {len(saved)} 张图到 featag_out/")
+        except Exception as e:  # noqa: BLE001 - 兜底，回传永不影响生成
+            _log(f"回传异常：{e}")
+            try:
+                _write_status("error", error=str(e))
+            except Exception:
+                pass
+
 
 def _on_app_started(demo=None, app=None):
+    try:
+        os.makedirs(FEETAG_OUT_DIR, exist_ok=True)
+    except OSError:
+        pass
+    _write_status("idle")  # 启动即发初态（含 choices），编辑器据此判断插件在线
     cfg = _load_config()
     if not cfg["autostart"]:
         return
@@ -454,4 +704,5 @@ def _on_app_started(demo=None, app=None):
     _log(f"自动启动编辑器：{message}")
 
 
+script_callbacks.on_after_component(_on_after_component)
 script_callbacks.on_app_started(_on_app_started)

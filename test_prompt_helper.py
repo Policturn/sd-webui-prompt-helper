@@ -42,6 +42,7 @@ class _Comp:
 gradio = types.ModuleType("gradio")
 for name in ("Accordion", "Row", "Checkbox", "Radio", "Textbox", "HTML", "Button"):
     setattr(gradio, name, type(name, (_Comp,), {}))
+gradio.update = lambda **kwargs: dict(kwargs, __type__="update")
 
 scripts_mod = types.ModuleType("modules.scripts")
 
@@ -55,7 +56,9 @@ scripts_mod.AlwaysVisible = object()
 
 callbacks_mod = types.ModuleType("modules.script_callbacks")
 _registered_callbacks = []
+_after_component_cbs = []
 callbacks_mod.on_app_started = lambda cb, name=None: _registered_callbacks.append(cb)
+callbacks_mod.on_after_component = lambda cb, name=None: _after_component_cbs.append(cb)
 
 modules_pkg = types.ModuleType("modules")
 modules_pkg.scripts = scripts_mod
@@ -73,8 +76,15 @@ sys.modules["prompt_helper"] = mod
 spec.loader.exec_module(mod)
 ns = mod.__dict__
 
-# before_process 会把参数写回配置文件，测试期间改用临时配置，避免污染真实配置
-ns["CONFIG_PATH"] = os.path.join(tempfile.mkdtemp(), "config.json")
+# before_process 会把参数写回配置文件，测试期间改用临时配置，避免污染真实配置；
+# 总线文件（status/params/cmd/featag_out）同理重定向到临时目录
+TMP_DIR = tempfile.mkdtemp()
+ns["CONFIG_PATH"] = os.path.join(TMP_DIR, "config.json")
+ns["PARAMS_PATH"] = os.path.join(TMP_DIR, "params.json")
+ns["CMD_PATH"] = os.path.join(TMP_DIR, "cmd.json")
+ns["STATUS_PATH"] = os.path.join(TMP_DIR, "status.json")
+ns["FEETAG_OUT_DIR"] = os.path.join(TMP_DIR, "featag_out")
+ns["_status_snapshot"] = None
 
 
 class FakeP:
@@ -82,6 +92,11 @@ class FakeP:
         self.prompt = "masterpiece, best quality"
         self.negative_prompt = "lowres"
         self.extra_generation_params = {}
+
+
+class FakeProcessed:
+    def __init__(self, images):
+        self.images = images
 
 
 def check(label, cond):
@@ -237,6 +252,137 @@ check("injected_tags 按展开前平铺 tag 流计数（BREAK 不吃掉逗号）
 
 os.unlink(META_TXT)
 os.unlink(META_NEG)
+
+print("== 生成页总线：bus 读取 ==")
+check("bus json：文件缺失返回 None", ns["_read_bus_json"](ns["CMD_PATH"]) is None)
+with open(ns["CMD_PATH"], "w", encoding="utf-8") as f:
+    f.write('{"action": "gener')  # 半截 JSON（编辑器写入瞬间）
+check("bus json：损坏内容返回 None", ns["_read_bus_json"](ns["CMD_PATH"]) is None)
+with open(ns["CMD_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"action": "generate", "page": "txt2img", "ts": 1}, f)
+check("bus json：正常内容读回", ns["_read_bus_json"](ns["CMD_PATH"])["page"] == "txt2img")
+os.unlink(ns["CMD_PATH"])
+
+print("== 生成页总线：status 状态机（内容不变不重写）==")
+ns["_gen_pass"] = 0
+ns["_status_snapshot"] = None
+ns["_write_status"]("idle")
+check("status 首写 idle", os.path.isfile(ns["STATUS_PATH"]))
+with open(ns["STATUS_PATH"], encoding="utf-8") as f:
+    first = json.load(f)
+check("status 结构（state/pass/images/error/ts/plugin/choices）",
+      first["state"] == "idle" and first["pass"] == 0 and first["images"] == []
+      and first["error"] is None and isinstance(first["ts"], int)
+      and first["choices"] == {} and first["plugin"] == ns["PLUGIN_VERSION"])
+mtime_before = os.stat(ns["STATUS_PATH"]).st_mtime_ns
+ns["_write_status"]("idle")
+check("内容未变化不重写", os.stat(ns["STATUS_PATH"]).st_mtime_ns == mtime_before)
+ns["_gen_pass"] = 1
+ns["_write_status"]("busy")
+ns["_write_status"]("done", images=["a.png", "b.png"])
+with open(ns["STATUS_PATH"], encoding="utf-8") as f:
+    done = json.load(f)
+check("busy→done 推进并携带图片清单", done["state"] == "done" and done["pass"] == 1
+      and done["images"] == ["a.png", "b.png"] and done["ts"] >= first["ts"])
+
+print("== 生成页总线：组件捕获 + apply 参数回填 ==")
+check("on_after_component 回调已注册", len(_after_component_cbs) >= 1)
+
+
+class FakeComp:
+    """带 elem_id / 组件属性的最小替身（滑杆范围、下拉 choices 等）。"""
+
+    def __init__(self, elem_id=None, **attrs):
+        self.elem_id = elem_id
+        for k, v in attrs.items():
+            setattr(self, k, v)
+
+
+cb = _after_component_cbs[-1]
+width_comp = FakeComp(elem_id="txt2img_width", minimum=64, maximum=2048)
+cb(width_comp)
+cb(FakeComp(elem_id="unrelated_thing"))
+check("表内组件捕获、表外忽略",
+      ns["_UI_COMPONENTS"].get("txt2img_width") is width_comp
+      and "unrelated_thing" not in ns["_UI_COMPONENTS"])
+
+slider = FakeComp(minimum=64, maximum=2048)
+targets = [
+    ("base", "width", slider, "slider_int"),
+    ("base", "seed", FakeComp(), "number"),
+    ("base", "sampler_name", FakeComp(choices=["Euler a", "Euler"]), "dropdown"),
+    ("base", "cfg_scale", FakeComp(minimum=1.0, maximum=30.0), "slider_float"),
+    ("hires", "enable", FakeComp(), "checkbox"),
+    ("hires", "denoise", FakeComp(minimum=0.0, maximum=1.0), "slider_float"),
+]
+handler = ns["_make_apply_handler"](targets)
+with open(ns["PARAMS_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"base": {"width": 832, "seed": -1, "sampler_name": "Euler a", "cfg_scale": 7.5},
+               "hires": {"enable": True, "denoise": 0.45}}, f)
+check("apply：各类型转换回填", handler() == [
+    {"__type__": "update", "value": 832},
+    {"__type__": "update", "value": -1},
+    {"__type__": "update", "value": "Euler a"},
+    {"__type__": "update", "value": 7.5},
+    {"__type__": "update", "value": True},
+    {"__type__": "update", "value": 0.45},
+])
+with open(ns["PARAMS_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"base": {"width": 99999, "sampler_name": "NoSuch", "unknown": 1},
+               "hires": {"denoise": None}}, f)
+check("apply：越界夹取 / 非法下拉跳过 / 未注册键与 null 不覆盖", handler() == [
+    {"__type__": "update", "value": 2048},
+    {"__type__": "update"},
+    {"__type__": "update"},
+    {"__type__": "update"},
+    {"__type__": "update"},
+    {"__type__": "update"},
+])
+with open(ns["PARAMS_PATH"], "w", encoding="utf-8") as f:
+    f.write("{{{broken")
+check("apply：params 损坏时全部不覆盖", handler() == [{"__type__": "update"}] * 6)
+os.unlink(ns["PARAMS_PATH"])
+
+print("== 生成页总线：postprocess 回传 + ADetailer 内部 pass 防御 ==")
+os.makedirs(ns["FEETAG_OUT_DIR"], exist_ok=True)
+
+
+class FakeImage:
+    def __init__(self):
+        self.save_paths = []
+
+    def save(self, path):
+        self.save_paths.append(path)
+        with open(path, "wb") as f:  # 真实落盘，postprocess 才能通过 listdir 断言
+            f.write(b"png")
+
+
+before_pass = ns["_gen_pass"]
+inner_p = FakeP()
+inner_p._ad_inner = True
+script.before_process(inner_p, True, REAL_TXT, "", True, False, "")
+check("before_process：内部 pass 直接 return（不注入不计数）",
+      inner_p.prompt == "masterpiece, best quality" and ns["_gen_pass"] == before_pass)
+script.postprocess(inner_p, FakeProcessed([]))
+check("postprocess：内部 pass 不回传", ns["_gen_pass"] == before_pass
+      and not os.listdir(ns["FEETAG_OUT_DIR"]))
+
+gen_p = FakeP()
+script.before_process(gen_p, True, REAL_TXT, "", True, False, "")
+check("before_process：正常生成置 busy 且计数 +1", ns["_gen_pass"] == before_pass + 1
+      and json.load(open(ns["STATUS_PATH"], encoding="utf-8"))["state"] == "busy")
+
+imgs = [FakeImage(), FakeImage(), FakeImage()]
+script.postprocess(gen_p, FakeProcessed(imgs))
+saved = sorted(os.listdir(ns["FEETAG_OUT_DIR"]))
+check("postprocess：全部落盘 fth_ 时间戳命名", len(saved) == 3
+      and all(name.startswith("fth_") and name.endswith(".png") for name in saved)
+      and [img.save_paths[0] for img in imgs] == [os.path.join(ns["FEETAG_OUT_DIR"], n) for n in saved])
+with open(ns["STATUS_PATH"], encoding="utf-8") as f:
+    final = json.load(f)
+check("postprocess：状态 done + 绝对路径清单", final["state"] == "done"
+      and final["images"] == [os.path.join(ns["FEETAG_OUT_DIR"], n) for n in saved]
+      and final["pass"] == before_pass + 1)
 
 print("== 编辑器联动启动 ==")
 check("on_app_started 回调已注册", len(_registered_callbacks) >= 1)

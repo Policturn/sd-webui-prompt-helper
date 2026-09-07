@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 config.json
+params.json
+cmd.json
+status.json
+featag_out/
