@@ -53,8 +53,11 @@ import threading
 import time
 
 import gradio as gr
-from modules import script_callbacks
-from modules.scripts import AlwaysVisible, Script
+from modules import script_callbacks, scripts
+from modules.scripts import AlwaysVisible
+# 注意：不从 modules.scripts 导入 Script 基类名——register_scripts_from_module 会把
+# 模块命名空间里的所有 Script 子类注册为脚本（含基类本身），基类实例的 title() 会
+# 抛 NotImplementedError 造成启动日志 4 条报错（v1.4.5 修复，见通宵记录）。
 
 EXT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(EXT_DIR, "config.json")
@@ -68,7 +71,7 @@ FEETAG_OUT_DIR = os.path.join(EXT_DIR, "featag_out")
 # 默认关闭——词条注入（本插件核心功能）不受影响；排查期防止任何总线副作用。
 ARMED_PATH = os.path.join(EXT_DIR, "bus.armed")
 
-PLUGIN_VERSION = "1.4.4"
+PLUGIN_VERSION = "1.4.5"
 
 CONTROL_KEYS = ("enabled", "path", "negative_path", "merge_lines",
                 "autostart", "editor_path")
@@ -119,13 +122,69 @@ _HIRES_FIELDS = [  # hires 仅文生图；hr_checkpoint（中途换模型）按�
     ("denoise", "txt2img_denoising_strength", "slider_float"),
 ]
 
+# —— M-31b 超分区脚本注入表（v1.4.5）——
+# Tiled Diffusion（multidiffusion 扩展，AlwaysVisible 常驻；tab=txt2img/img2img，
+# 前缀式 uid 与两处后缀式特例并存——已对照源码逐条锁定）：
+_TILED_COMMON = [
+    ("enable", "MD-{tab}-enabled-checkbox", "checkbox"),          # InputAccordion 隐藏勾选框
+    ("method", "MD-{tab}-method", "dropdown"),
+    ("tile_w", "MD-{tab}-latent-tile-width", "slider_int"),
+    ("tile_h", "MD-{tab}-latent-tile-height", "slider_int"),
+    ("overlap", "MD-{tab}-latent-tile-overlap", "slider_int"),
+    ("upscaler", "MD-{tab}-upscaler-index", "dropdown"),
+    ("scale", "MD-{tab}-upscaler-factor", "slider_float"),
+]
+_TILED_FIELDS = {
+    False: _TILED_COMMON + [  # txt2img 独有：Overwrite image size
+        ("overwrite_size", "MD-{tab}-overwrite-image-size", "checkbox"),
+        ("image_width", "MD-overwrite-width-{tab}", "slider_int"),   # 后缀式特例
+        ("image_height", "MD-overwrite-height-{tab}", "slider_int"),
+    ],
+    True: _TILED_COMMON + [   # img2img 独有：Keep input image size
+        ("keep_input_size", "MD-{tab}-keep-input-size", "checkbox"),
+    ],
+}
+# Tiled VAE（同扩展另一常驻脚本；tab 短拼法 t2i/i2i）
+_TILEDVAE_FIELDS = [
+    ("enable", "MDV-{tab}-enabled-checkbox", "checkbox"),
+    ("vae_to_gpu", "MD-{tab}-vae2gpu", "checkbox"),
+    ("encoder_tile_size", "MD-{tab}-enc-size", "slider_int"),
+    ("decoder_tile_size", "MD-{tab}-dec-size", "slider_int"),
+    ("fast_encoder", "MD-{tab}-fastenc", "checkbox"),
+    ("color_fix", "MD-{tab}-fastenc-colorfix", "checkbox"),
+    ("fast_decoder", "MD-{tab}-fastdec", "checkbox"),
+]
+# Ultimate SD upscale（img2img 可选脚本——注入时需同时把脚本下拉选中）
+_USDU_FIELDS = [
+    ("target_size_type", "ultimateupscale_target_size_type", "dropdown_index"),
+    ("custom_width", "ultimateupscale_custom_width", "slider_int"),
+    ("custom_height", "ultimateupscale_custom_height", "slider_int"),
+    ("custom_scale", "ultimateupscale_custom_scale", "slider_float"),
+    ("upscaler", "ultimateupscale_upscaler_index", "radio"),
+    ("redraw_mode", "ultimateupscale_redraw_mode", "dropdown_index"),
+    ("tile_width", "ultimateupscale_tile_width", "slider_int"),
+    ("tile_height", "ultimateupscale_tile_height", "slider_int"),
+    ("mask_blur", "ultimateupscale_mask_blur", "slider_int"),
+    ("padding", "ultimateupscale_padding", "slider_int"),
+    ("seams_fix_type", "ultimateupscale_seams_fix_type", "dropdown_index"),
+]
+_USDU_SCRIPT_TITLE = "Ultimate SD upscale"
+_USDU_SCRIPT_LIST_ID = "script_list"   # txt2img/img2img 各渲染一份（按创建序区分页）
+
 
 def _field_table(is_img2img):
     """某页的可覆盖字段表：[(总线分区, 语义键, elem_id, 组件类型)]。"""
     tab = "img2img" if is_img2img else "txt2img"
-    table = [("base", key, f"{tab}_{elem}", kind) for key, elem, kind in _BASE_FIELDS]
+    table = [("base", key, f"{tab}_{e}", kind) for key, e, kind in _BASE_FIELDS]
     if not is_img2img:
-        table += [("hires", key, elem, kind) for key, elem, kind in _HIRES_FIELDS]
+        table += [("hires", key, e, kind) for key, e, kind in _HIRES_FIELDS]
+    short_tab = "i2i" if is_img2img else "t2i"   # Tiled Diffusion 与 Tiled VAE 均用短拼法（源码实锤）
+    for key, fmt, kind in _TILED_FIELDS[is_img2img]:
+        table.append(("tiled", key, fmt.format(tab=short_tab), kind))
+    for key, fmt, kind in _TILEDVAE_FIELDS:
+        table.append(("tiledvae", key, fmt.format(tab=short_tab), kind))
+    if is_img2img:
+        table += [("usdu", key, e, kind) for key, e, kind in _USDU_FIELDS]
     return table
 
 
@@ -134,6 +193,14 @@ _WANTED_ELEM_IDS = {row[2] for rows in _FIELD_TABLES.values() for row in rows}
 
 # on_after_component 捕获到的页面组件（elem_id -> gradio 组件）
 _UI_COMPONENTS = {}
+# 脚本下拉（elem_id="script_list"，txt2img/img2img 各一份、同 id）——按创建序存放
+_SCRIPT_LISTS = []
+# 总线按钮与接线状态（延迟接线：等该页全部目标组件捕获齐全后再注册事件——
+# USDU 等扩展的组件创建晚于本插件 ui()，ui() 时点快照会漏）
+_BUS_BUTTONS = {}
+_AD_BUTTONS = {}
+_AD_FIELDS = {}
+_WIRED = {}
 
 # status.json 写入去重（内容未变化不重写）+ 生成计数
 _status_lock = threading.Lock()
@@ -173,16 +240,16 @@ def _publish_choices():
         return {}
 
 
-def _write_status(state, images=None, error=None):
-    """写 status.json（state/pass/images/error/ts + choices）。
+def _write_status(state, images=None, error=None, adetailer=None):
+    """写 status.json（state/pass/images/error/ts + choices [+ adetailer]）。
 
-    内容签名（state/pass/images/error/choices）未变化时不重写——客户端高频轮询
+    内容签名（state/pass/images/error/adetailer/choices）未变化时不重写——客户端高频轮询
     的只是不再变化的文件，磁盘零增长；ts 仅在真实写入时刷新。
     任何写入异常只打日志，绝不影响生成。
     """
     global _status_snapshot
     choices = _publish_choices()
-    signature = json.dumps([state, _gen_pass, list(images or []), error, choices],
+    signature = json.dumps([state, _gen_pass, list(images or []), error, adetailer, choices],
                            ensure_ascii=False, default=str)
     with _status_lock:
         if signature == _status_snapshot:
@@ -196,6 +263,8 @@ def _write_status(state, images=None, error=None):
             "plugin": PLUGIN_VERSION,
             "choices": choices,
         }
+        if adetailer is not None:
+            payload["adetailer"] = adetailer
         try:
             with open(STATUS_PATH, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False)
@@ -211,6 +280,20 @@ def _coerce_value(kind, value, comp):
         return bool(value)
     if kind == "number":
         return int(float(value))
+    if kind == "dropdown_index":
+        # type="index" 的下拉：接受选项序号（int）
+        idx = int(float(value))
+        choices = list(getattr(comp, "choices", []) or [])
+        if choices and not 0 <= idx < len(choices):
+            return None
+        return idx
+    if kind == "radio":
+        # type="index" 的 Radio：编辑器传选项名 → 换算序号
+        choices = list(getattr(comp, "choices", []) or [])
+        text = str(value)
+        if text in choices:
+            return choices.index(text)
+        return None
     if kind in ("slider_int", "slider_float"):
         num = float(value)
         minimum = getattr(comp, "minimum", None)
@@ -222,18 +305,47 @@ def _coerce_value(kind, value, comp):
         return int(num) if kind == "slider_int" else round(num, 4)
     text = str(value)
     if kind == "dropdown":
-        choices = list(getattr(comp, "choices", None) or [])
+        choices = list(getattr(comp, "choices", []) or [])
         if choices and text not in choices:
             return None
     return text
 
 
-def _make_apply_handler(targets):
-    """生成页隐藏 apply 钮的处理函数：读 params.json，按 targets（闭包含组件引用）
-    产出 gr.update 列表。键不出现 / 显式 null / 值非法 → 原样 gr.update() 不覆盖。"""
+def _try_wire_page(is_img2img):
+    """延迟接线：该页全部目标组件捕获齐全 + 按钮已创建时，注册 apply/ADetailer 事件。
+    幂等（每页只接一次）；由 _on_after_component 与 ui() 末尾共同触发。"""
+    if _WIRED.get(is_img2img) or is_img2img not in _BUS_BUTTONS:
+        return
+    wanted = [row[2] for row in _FIELD_TABLES[is_img2img]]
+    missing = [e for e in wanted if e not in _UI_COMPONENTS]
+    if missing:
+        return
+    tab = "img2img" if is_img2img else "txt2img"
+    targets = []
+    if is_img2img and len(_SCRIPT_LISTS) > 1:
+        targets.append(("usdu", "_select", _SCRIPT_LISTS[1], "scriptsel"))
+    targets += [(section, key, _UI_COMPONENTS[elem_id], kind)
+                for section, key, elem_id, kind in _FIELD_TABLES[is_img2img]]
+    ad_fields = _AD_FIELDS.get(is_img2img) or []
+    # ADetailer 回填并入同一事件（单事件双段更新）——独立第二按钮的接线在部分
+    # 页面不可靠（config 实测 txt2img AD 依赖缺失），合并后彻底消除该变量
+    outputs = [t[2] for t in targets] + [comp for comp, _key in ad_fields]
+    apply_btn = _BUS_BUTTONS[is_img2img]
+    apply_btn.click(fn=_make_apply_handler(targets, ad_fields), inputs=[],
+                    outputs=outputs, show_progress=False, queue=False)
+    _WIRED[is_img2img] = True
+    _log(f"生成页（{tab}）总线已接线：apply {len(targets)} 项输出 + ADetailer 回填 {len(ad_fields)} 项（同一事件）")
+
+
+def _make_apply_handler(targets, ad_fields=None):
+    """生成页隐藏 apply 钮的处理函数：读 params.json，产出 gr.update 列表——
+    前段=targets（base/hires/scripts 界面组件），后段=ad_fields（ADetailer infotext
+    回填，v1.4.5 起并入同一事件）。键不出现 / 显式 null / 值非法 → gr.update() 不覆盖。"""
+    ad_fields = ad_fields or []
+
     def handler():
         if not bus_armed():
-            return [gr.update() for _ in targets]  # 总开关关闭：回填全部 no-op
+            return [gr.update() for _ in targets] + [gr.update() for _ in ad_fields]
         params = _read_bus_json(PARAMS_PATH)
         params = params if isinstance(params, dict) else {}
         updates, applied, skipped = [], [], []
@@ -242,6 +354,18 @@ def _make_apply_handler(targets):
             value = _MISSING
             if isinstance(section_data, dict) and key in section_data:
                 value = section_data[key]
+            if kind == "scriptsel":
+                # USDU 特例：scripts.usdu 出现（enable=true 或带任意字段）→ 选中该脚本
+                usdu = section_data.get("usdu") if isinstance(section_data, dict) else None
+                want = isinstance(usdu, dict) and (usdu.get("enable") is True or len(usdu) > 0)
+                if want:
+                    choices = list(getattr(comp, "choices", []) or [])
+                    idx = choices.index(_USDU_SCRIPT_TITLE) if _USDU_SCRIPT_TITLE in choices else -1
+                    updates.append(gr.update(value=idx) if idx >= 0 else gr.update())
+                    applied.append(f"usdu.select={idx}")
+                else:
+                    updates.append(gr.update())
+                continue
             if value is _MISSING or value is None:
                 updates.append(gr.update())
                 continue
@@ -260,8 +384,104 @@ def _make_apply_handler(targets):
             if skipped:
                 message += f"（跳过：{', '.join(skipped)}）"
             _log(message)
+
+        # —— ADetailer infotext 回填段（单事件双段更新的第二段）——
+        ad_text = params.get("adetailer_infotext")
+        ad_text = ad_text if isinstance(ad_text, str) else ""
+        if ad_text.strip():
+            try:
+                from modules import infotext_utils
+                parsed = infotext_utils.parse_generation_parameters(ad_text)
+            except Exception as e:
+                _log(f"ADetailer infotext 解析失败：{e}")
+                parsed = {}
+            for comp, key in ad_fields:
+                value = None
+                if isinstance(key, str):
+                    value = parsed.get(key)
+                elif callable(key):
+                    try:
+                        value = key(parsed)
+                    except Exception:
+                        value = None
+                if value is None:
+                    updates.append(gr.update())
+                    continue
+                val = _paste_style_value(comp, value)
+                if val is None:
+                    updates.append(gr.update())
+                    continue
+                updates.append(gr.update(value=val))
+            _log(f"ADetailer infotext 回填完成（{len(ad_fields)} 组件）")
         return updates
     return handler
+
+
+def _paste_style_value(comp, value):
+    """按 connect_paste 的同款规则把 infotext 文本值转成组件值（失败返回 None）。"""
+    try:
+        valtype = type(comp.value)
+        if valtype is bool and value == "False":
+            return False
+        if valtype is int:
+            return int(float(value))
+        return valtype(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _make_adetailer_apply_handler(fields):
+    """ADetailer infotext 回填（M-31c/P4，通道定案见论证文档 §7.3）：
+    读 params.json 的 adetailer_infotext（编辑器拼好的参数文本），经
+    parse_generation_parameters 解析后按 ADetailer 自注册的 infotext_fields
+    批量 gr.update——与 connect_paste 同机制，键驱动、缺键跳过。"""
+    def handler():
+        if not bus_armed() or not fields:
+            return [gr.update() for _ in fields]
+        params = _read_bus_json(PARAMS_PATH) or {}
+        text = params.get("adetailer_infotext")
+        text = text if isinstance(text, str) else ""
+        if not text.strip():
+            return [gr.update() for _ in fields]
+        try:
+            from modules import infotext_utils
+            parsed = infotext_utils.parse_generation_parameters(text)
+        except Exception as e:
+            _log(f"ADetailer infotext 解析失败：{e}")
+            return [gr.update() for _ in fields]
+        updates, applied = [], []
+        for comp, key in fields:
+            value = None
+            if isinstance(key, str):
+                value = parsed.get(key)
+            elif callable(key):
+                try:
+                    value = key(parsed)
+                except Exception:
+                    value = None
+            if value is None:
+                updates.append(gr.update())
+                continue
+            val = _paste_style_value(comp, value)
+            if val is None:
+                updates.append(gr.update())
+                continue
+            updates.append(gr.update(value=val))
+            applied.append(f"{key}={val}")
+        _log(f"ADetailer infotext 回填：{', '.join(applied) if applied else '无生效键'}")
+        return updates
+    return handler
+
+
+def _adetailer_marks(p):
+    """从 extra_generation_params 提取 ADetailer 参与标记（P4 pass 标注）。
+    无 ADetailer 行 = 空表（status 不带该键）。"""
+    try:
+        marks = sorted(str(k) for k in (getattr(p, "extra_generation_params", {}) or {})
+                       if str(k).startswith("ADetailer"))
+        return marks or None
+    except Exception:
+        return None
 
 
 def _on_after_component(component, **kwargs):
@@ -270,8 +490,14 @@ def _on_after_component(component, **kwargs):
         elem_id = getattr(component, "elem_id", None)
         if elem_id in _WANTED_ELEM_IDS:
             _UI_COMPONENTS[elem_id] = component
-    except Exception:
-        pass
+        elif elem_id == _USDU_SCRIPT_LIST_ID:
+            _SCRIPT_LISTS.append(component)  # 创建序：0=txt2img, 1=img2img
+    finally:
+        try:
+            _try_wire_page(False)
+            _try_wire_page(True)
+        except Exception:
+            pass
 
 
 def _log(message):
@@ -537,13 +763,13 @@ def _wire_controls(controls, is_img2img):
     _TAB_CONTROLS[is_img2img] = controls
 
 
-class PromptHelperScript(Script):
+class PromptHelperScript(scripts.Script):
 
     def title(self):
         return "外部提示词注入 (prompt-helper)"
 
     def show(self, is_img2img):
-        return AlwaysVisible
+        return scripts.AlwaysVisible
 
     def ui(self, is_img2img):
         cfg = _load_config()
@@ -599,20 +825,33 @@ class PromptHelperScript(Script):
         # params.json → gr.update 回填界面组件，未捕获/缺失的组件自动跳过），
         # 稍候再点该页生成钮，走 UI 正常队列。visible=False 的 Button 仍在 DOM
         # 中可被 JS 点击（A1111 自家 img2img_update_resize_to 同款用法）。
+        # 总线按钮（v1.4.5 起延迟接线：事件注册推迟到该页全部目标组件捕获齐全时
+        # ——由 _on_after_component 调 _try_wire_page 完成——避免 USDU 等晚创建
+        # 组件被 ui() 时点快照漏掉）。visible=False 的按钮仍可被 JS 点击
+        # （A1111 自家 img2img_update_resize_to 同款用法）。
         tab = "img2img" if is_img2img else "txt2img"
-        targets = [(section, key, _UI_COMPONENTS[elem_id], kind)
-                   for section, key, elem_id, kind in _FIELD_TABLES[is_img2img]
-                   if elem_id in _UI_COMPONENTS]
-        missing = [row[2] for row in _FIELD_TABLES[is_img2img]
-                   if row[2] not in _UI_COMPONENTS]
-        if missing:
-            _log(f"生成页（{tab}）未捕获组件：{', '.join(missing)}（对应参数将跳过）")
         apply_button = gr.Button(value="feetag-apply", visible=False,
                                  elem_id=f"feetag_apply_{tab}")
-        if targets:
-            apply_button.click(fn=_make_apply_handler(targets), inputs=[],
-                               outputs=[row[2] for row in targets],
-                               show_progress=False, queue=False)
+        _BUS_BUTTONS[is_img2img] = apply_button
+
+        # ADetailer infotext 回填通道（M-31c/P4）：复刻 connect_paste 的键驱动回填，
+        # 仅作用于 ADetailer 自注册的 infotext_fields；扩展缺失时静默跳过
+        ad_fields = []
+        try:
+            from modules import scripts as a1111_scripts
+            runner = a1111_scripts.scripts_img2img if is_img2img else a1111_scripts.scripts_txt2img
+            ad_script = runner.script("ADetailer")
+            ad_fields = list(getattr(ad_script, "infotext_fields", None) or [])
+        except Exception as e:
+            _log(f"ADetailer infotext_fields 捕获失败（{tab}）：{e}")
+        _AD_FIELDS[is_img2img] = ad_fields
+        ad_button = gr.Button(value="feetag-adetailer-apply", visible=False,
+                              elem_id=f"feetag_adetailer_apply_{tab}")
+        _AD_BUTTONS[is_img2img] = ad_button
+        if not ad_fields:
+            _log(f"ADetailer 未安装或未注册 infotext_fields（{tab}）——回填通道跳过")
+
+        _try_wire_page(is_img2img)
 
         controls = {
             "enabled": enabled,
@@ -711,7 +950,7 @@ class PromptHelperScript(Script):
                     saved.append(path)
                 except (AttributeError, OSError, ValueError) as e:
                     _log(f"回传图片 {i} 失败：{e}")
-            _write_status("done", images=saved)
+            _write_status("done", images=saved, adetailer=_adetailer_marks(p))
             _log(f"已回传 {len(saved)} 张图到 featag_out/")
         except Exception as e:  # noqa: BLE001 - 兜底，回传永不影响生成
             _log(f"回传异常：{e}")

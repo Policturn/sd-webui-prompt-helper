@@ -69,10 +69,13 @@
             console.info("[feetag] 忽略暂不支持的目标页：" + cmd.page);
             return;
         }
-        // 1) 先 apply（服务端读 params.json 回填界面），2) 切页签，3) 点生成
+        // 1) 先 apply（服务端读 params.json 回填界面）+ ADetailer infotext 回填，2) 切页签，3) 点生成
         try {
             clickById("feetag_apply_" + page, "参数回填钮");
         } catch (e) { /* 回填失败不阻断触发 */ }
+        try {
+            clickById("feetag_adetailer_apply_" + page, "ADetailer 回填钮");
+        } catch (e) { /* 未安装 ADetailer 时静默 */ }
         setTimeout(function () {
             try {
                 var sw = window["switch_to_" + page];
