@@ -40,6 +40,13 @@ status.json（state/pass/images/error/ts + choices）只在内容变化时重写
 v1.4.3 起总线带总开关：插件目录放置 bus.armed 标志文件才启用全部总线行为
 （JS 轮询 / status 写入 / featag_out 回传 / apply 回填），默认关闭——词条注入
 不受开关影响。放置/删除即刻生效，无需重启。
+
+v1.4.6 修复 cmd 指令的多消费者竞态：cmd.json 是单槽文件，旧版浏览器 JS 经
+/file= 直读（只读不删，靠各自 localStorage 的 ts 去重），多浏览器 / 多页签
+并存时同一条命令会被多方同时触发（实测：用户与测试浏览器先后点生成，用户
+命令被测试页面抢走）。改为服务端原子消费端点 GET /feetag/bus/cmd：先重命名
+到临时名再读删（同卷原子操作，改名成功者独得），每条命令全局恰有一个消费者
+能取到，其余请求得到 404；JS 轮询改调该端点，lastTs 去重保留为双保险。
 """
 
 import base64
@@ -71,7 +78,7 @@ FEETAG_OUT_DIR = os.path.join(EXT_DIR, "featag_out")
 # 默认关闭——词条注入（本插件核心功能）不受影响；排查期防止任何总线副作用。
 ARMED_PATH = os.path.join(EXT_DIR, "bus.armed")
 
-PLUGIN_VERSION = "1.4.5"
+PLUGIN_VERSION = "1.4.6"
 
 CONTROL_KEYS = ("enabled", "path", "negative_path", "merge_lines",
                 "autostart", "editor_path")
@@ -206,6 +213,9 @@ _WIRED = {}
 _status_lock = threading.Lock()
 _status_snapshot = None
 _gen_pass = 0
+# cmd.json 原子消费锁（v1.4.6）：fastapi 线程池并发处理 GET /feetag/bus/cmd，
+# 锁 + 改名保证"读后即删"退路也只可能有一个赢家
+_cmd_lock = threading.Lock()
 
 
 def bus_armed():
@@ -224,6 +234,48 @@ def _read_bus_json(path):
             if attempt == 0:
                 time.sleep(0.1)
     return None
+
+
+def _consume_cmd():
+    """原子取走一条 cmd 指令（v1.4.6）：先重命名到临时名再读删。
+
+    多浏览器 / 多页签并存时，每条命令全局恰有一个消费者能取到：重命名是同目录
+    同卷的原子操作，改名成功的请求独得该命令，其余请求拿到 FileNotFoundError
+    → 返回 None（端点转 404）。改名被占用（旧版页面经 /file= 读取的瞬间）时
+    退回"读后即删"，服务端 _cmd_lock 串行化 + 客户端 lastTs 去重双保险。
+    半截 JSON（编辑器写入瞬间被取走）短暂重试后仍失败则消费丢弃并打日志，
+    防止坏文件反复触发；返回 dict 或 None，不抛错。
+    """
+    tmp = f"{CMD_PATH}.consuming-{os.getpid()}-{threading.get_ident()}-{time.time_ns()}"
+    with _cmd_lock:
+        try:
+            os.rename(CMD_PATH, tmp)
+        except FileNotFoundError:
+            return None  # 无命令 / 已被其他消费者取走：常态
+        except OSError:
+            # 改名失败（文件被短暂占用）：退回读后即删
+            data = _read_bus_json(CMD_PATH)
+            try:
+                os.remove(CMD_PATH)
+            except OSError:
+                pass
+            return data if isinstance(data, dict) else None
+        data = None
+        for attempt in range(3):  # 编辑器写文件的一瞬可能读到半个 JSON，短暂重试
+            try:
+                with open(tmp, "r", encoding="utf-8-sig") as f:
+                    data = json.load(f)
+                break
+            except (OSError, ValueError):
+                if attempt < 2:
+                    time.sleep(0.15)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        if data is None:
+            _log("cmd.json 内容损坏，已消费丢弃（编辑器侧可重新触发）")
+        return data if isinstance(data, dict) else None
 
 
 def _publish_choices():
@@ -961,12 +1013,15 @@ class PromptHelperScript(scripts.Script):
 
 
 def _register_bus_endpoints(app):
-    """注册总线只读端点（v1.4.4）：
+    """注册总线端点（v1.4.4 只读 + v1.4.6 cmd 原子消费）：
       GET /feetag/bus/status         → status.json 内容（application/json）
       GET /feetag/bus/image?name=xx  → featag_out/<name>（basename 防穿越）
-    两者都带 Access-Control-Allow-Origin: *——编辑器面板（Tauri webview 的
+      GET /feetag/bus/cmd            → 原子取走 cmd.json：读取并删除，每条命令
+                                       全局恰有一个消费者取到（200），其余 404
+    三者都带 Access-Control-Allow-Origin: *——编辑器面板（Tauri webview 的
     tauri.localhost 源 / dev 的 localhost:5173 源）跨源读取 /file= 会被 CORS
-    拦截（gradio 的 CORS 只放行本机同名源），自有端点解决之。
+    拦截（gradio 的 CORS 只放行本机同名源），自有端点解决之；cmd 端点同时
+    解决多浏览器并存时单槽文件被竞态消费的问题（v1.4.6）。
     路由注册无条件（保证"放置 bus.armed 即生效"），内容按 bus_armed() 门控：
     未启用时一律 404，与总线默认关语义一致。"""
     try:
@@ -993,10 +1048,21 @@ def _register_bus_endpoints(app):
             return Response(status_code=404)
         return FileResponse(path, headers={"Access-Control-Allow-Origin": "*"})
 
+    def _bus_cmd():
+        if not bus_armed():
+            return Response(status_code=404)
+        cmd = _consume_cmd()
+        if cmd is None:
+            return Response(status_code=404)
+        return Response(content=json.dumps(cmd, ensure_ascii=False),
+                        media_type="application/json",
+                        headers={"Access-Control-Allow-Origin": "*"})
+
     try:
         app.add_api_route("/feetag/bus/status", _bus_status, methods=["GET"], include_in_schema=False)
         app.add_api_route("/feetag/bus/image", _bus_image, methods=["GET"], include_in_schema=False)
-        _log("总线端点已注册：GET /feetag/bus/status、/feetag/bus/image（bus.armed 门控）")
+        app.add_api_route("/feetag/bus/cmd", _bus_cmd, methods=["GET"], include_in_schema=False)
+        _log("总线端点已注册：GET /feetag/bus/status、/feetag/bus/image、/feetag/bus/cmd（bus.armed 门控）")
     except Exception as e:
         _log(f"总线端点注册失败（不影响其他功能）：{e}")
 

@@ -1,6 +1,8 @@
-// FeeTagHelper 生成页总线 · 浏览器端（v1.4.3，P2）
+// FeeTagHelper 生成页总线 · 浏览器端（v1.4.6，P2）
 //
-// 职责：轮询插件目录下的 cmd.json（编辑器写入），收到触发指令后——
+// 职责：轮询服务端原子消费端点 /feetag/bus/cmd（编辑器写 cmd.json，服务端
+//   读取并删除——v1.4.6 起不再经 /file= 直读：单槽文件在多浏览器 / 多页签
+//   并存时会被竞态消费，实测用户命令被测试页面抢走），收到触发指令后——
 //   1. 点击本插件的隐藏 apply 钮（服务端读 params.json → gr.update 回填界面组件，
 //      选择器表与回填逻辑见 scripts/prompt_helper.py）；
 //   2. 切换到目标页签（A1111 官方全局函数 switch_to_txt2img / switch_to_img2img）；
@@ -10,9 +12,10 @@
 // 未放置时每 15s 静默探测一次（单个 404 请求），零总线流量。放置/删除即生效，
 // 无需刷新页面。
 //
-// 总线文件经 WebUI 的 /file= 静态路由读取（与 A1111 加载本文件自身同一机制，
-// 已实测可达）。任何异常（文件不存在 / 服务未起 / 组件缺失）一律静默不炸，
-// 不影响 WebUI 自身使用。
+// cmd 消费语义（v1.4.6）：每条命令全局恰有一个消费者能取到（服务端先改名再读删，
+// 恰一方 200、其余 404）；本地 lastTs（localStorage，跨页签 + 刷新防重放）保留
+// 为双保险。任何异常（无命令 / 服务未起 / 组件缺失）一律静默不炸，不影响
+// WebUI 自身使用。
 
 (function () {
     "use strict";
@@ -94,16 +97,18 @@
     }
 
     function poll() {
-        fetch(busUrl("cmd.json"), { cache: "no-store" })
+        // v1.4.6：改调服务端原子消费端点（同源，无 CORS 问题）；恰一方取到命令，
+        // 其余消费者 404——多浏览器并存不再单槽竞态
+        fetch("/feetag/bus/cmd?t=" + Date.now(), { cache: "no-store" })
             .then(function (res) { return res.ok ? res.json() : null; })
             .then(function (cmd) {
-                if (!cmd || !cmd.action) return; // 文件不存在 / 空指令：常态，静默
+                if (!cmd || !cmd.action) return; // 404（无命令/已被取走）：常态，静默
                 var ts = String(cmd.ts || "");
-                if (!ts || ts === String(lastTs)) return; // 已处理过
+                if (!ts || ts === String(lastTs)) return; // 双保险：lastTs 防重放
                 markHandled(ts);
                 trigger(cmd);
             })
-            .catch(function () { /* 404（尚未配置）/ 服务未起：静默 */ });
+            .catch(function () { /* 无命令 / 服务未起：静默 */ });
     }
 
     // 总开关探测：bus.armed 存在才开始 cmd 轮询；未启用时仅 15s 一次探测（零总线流量）

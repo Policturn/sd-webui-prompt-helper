@@ -85,7 +85,7 @@ FeeTagHelper 构建区开启"携带元数据"时，txt 末尾会追加一个
 （块数 / 末块 token 数 / 是否截断），故不回传 `chunks` / `clipped`——编辑器
 端用自带 tokenizer 依据 `full_text` 自行计算，对齐由 tokenizer 本身保证。
 
-## 生成页总线（v1.4.2+，P1；v1.4.3 起带总开关）
+## 生成页总线（v1.4.2+，P1；v1.4.3 起带总开关；v1.4.6 起指令原子消费）
 
 本插件同时是 FeeTagHelper「生成」页的服务端：编辑器把要覆盖的参数与触发指令
 写进**插件目录**（与 config.json 同层），浏览器端 `javascript/feetag_generate.js`
@@ -94,11 +94,12 @@ FeeTagHelper 构建区开启"携带元数据"时，txt 末尾会追加一个
 | 文件 | 谁写 | 谁读 | 说明 |
 |---|---|---|---|
 | `params.json` | 编辑器 | 插件（apply 时读） | 要覆盖的参数，**只写要改的键**：`base`（width / height / seed / sampler_name / scheduler / steps / cfg_scale / batch_size / n_iter）+ `hires`（enable / upscaler / hr_scale / denoise / steps）；`img2img` / `extras` / `scripts` 段为后续版本预留 |
-| `cmd.json` | 编辑器 | 浏览器 JS（0.5s 轮询） | `{"action":"generate","page":"txt2img","ts":...}`，ts 递增防重放 |
-| `status.json` | 插件 | 编辑器轮询 | `{"state":"idle/busy/done/error","pass":N,"images":[绝对路径],"error","ts","plugin","choices"}`；内容不变不重写；`choices` 为 WebUI 当前实际可用的采样器 / 调度 / 超分列表（编辑器下拉对齐用） |
-| `featag_out/` | 插件 | 编辑器 | 每次生成的成品图副本，`fth_年月日_时分秒毫秒_N.png` 命名 |
+| `cmd.json` | 编辑器 | 插件（服务端原子消费） | `{"action":"generate","page":"txt2img","ts":...}`，ts 递增防重放。浏览器 JS 经 `GET /feetag/bus/cmd` 轮询：服务端读取并**删除**该文件，每条命令全局恰有一个消费者取到（200），其余请求 404——多浏览器 / 多页签并存不再竞态抢指令（v1.4.6 修复） |
+| `status.json` | 插件 | 编辑器轮询 | `{"state":"idle/busy/done/error","pass":N,"images":[绝对路径],"error","ts","plugin","choices"}`；内容不变不重写；`choices` 为 WebUI 当前实际可用的采样器 / 调度 / 超分列表（编辑器下拉对齐用）。只读端点 `GET /feetag/bus/status` |
+| `featag_out/` | 插件 | 编辑器 | 每次生成的成品图副本，`fth_年月日_时分秒毫秒_N.png` 命名。只读端点 `GET /feetag/bus/image?name=` |
 
-触发链路：编辑器写 params.json → 写 cmd.json → JS 点隐藏 apply 钮（服务端按
+触发链路：编辑器写 params.json → 写 cmd.json → JS 轮询 `/feetag/bus/cmd` 取到
+指令（恰一方）→ 点隐藏 apply 钮（服务端按
 语义键 → elem_id 选择器表把参数回填到界面组件：未出现的键不覆盖、越界夹取、
 下拉值非法跳过）→ JS 切到目标页签点生成钮 → WebUI 正常队列生成 → `postprocess`
 钩子把成品图存 featag_out/ 并置 done。Highres-fix 全参数同通道支持

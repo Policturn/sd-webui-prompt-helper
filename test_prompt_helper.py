@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import types
 
@@ -417,6 +418,74 @@ ns["_gen_pass"] = before_pass + 1
 ns["_write_status"]("idle")
 check("开关开：重新放置即恢复", json.load(open(ns["STATUS_PATH"], encoding="utf-8"))["pass"] == before_pass + 1)
 check("bus_armed 现查", ns["bus_armed"]() is True)
+
+print("== 生成页总线：cmd 原子消费端点（v1.4.6 多消费者竞态修复）==")
+check("bus json：文件缺失返回 None", ns["_read_bus_json"](ns["CMD_PATH"]) is None)
+
+
+class FakeApp:
+    """捕获 add_api_route 注册的端点处理器，供离线直调。"""
+
+    def __init__(self):
+        self.routes = {}
+
+    def add_api_route(self, path, endpoint, methods=None, include_in_schema=False):
+        self.routes[path] = endpoint
+
+
+fake_app = FakeApp()
+ns["_register_bus_endpoints"](fake_app)
+check("总线端点注册（status/image/cmd 三条）",
+      set(fake_app.routes) == {"/feetag/bus/status", "/feetag/bus/image", "/feetag/bus/cmd"})
+bus_cmd = fake_app.routes["/feetag/bus/cmd"]
+
+CMD = {"action": "generate", "page": "txt2img", "ts": 1788840420000}
+
+# 单消费者语义：取到 → 文件消失 → 再取 404
+with open(ns["CMD_PATH"], "w", encoding="utf-8") as f:
+    json.dump(CMD, f)
+resp = bus_cmd()
+check("cmd 端点：首次取到命令内容", resp.status_code == 200 and json.loads(resp.body) == CMD)
+check("cmd 端点：消费后文件已删除", not os.path.isfile(ns["CMD_PATH"]))
+check("cmd 端点：空槽返回 404", bus_cmd().status_code == 404)
+check("cmd 端点：无临时文件残留",
+      not [n for n in os.listdir(TMP_DIR) if ".consuming-" in n])
+
+# 双消费者竞态：两轮询方（两线程，经 Barrier 同时发起）抢同一条 cmd——
+# 恰一方 200 取到，另一方 404/None；修复前 /file= 直读会双方都取到
+with open(ns["CMD_PATH"], "w", encoding="utf-8") as f:
+    json.dump(CMD, f)
+results = []
+barrier = threading.Barrier(2)
+
+
+def _grab():
+    barrier.wait()
+    results.append(ns["_consume_cmd"]())
+
+
+grabbers = [threading.Thread(target=_grab) for _ in range(2)]
+for t in grabbers:
+    t.start()
+for t in grabbers:
+    t.join()
+got = [r for r in results if isinstance(r, dict)]
+check("竞态：两消费者恰一方取到同一条命令", len(got) == 1 and got[0] == CMD
+      and not os.path.isfile(ns["CMD_PATH"]))
+
+# 未启用态（bus.armed 拆除）：端点一律 404 且不消费
+os.remove(ns["ARMED_PATH"])
+with open(ns["CMD_PATH"], "w", encoding="utf-8") as f:
+    json.dump(CMD, f)
+check("cmd 端点：开关关一律 404 且不消费", bus_cmd().status_code == 404
+      and os.path.isfile(ns["CMD_PATH"]))
+open(ns["ARMED_PATH"], "w").close()
+
+# 半截 JSON（编辑器写入瞬间被取走）：消费丢弃，返回 404 防坏文件反复触发
+with open(ns["CMD_PATH"], "w", encoding="utf-8") as f:
+    f.write('{"action": "gener')
+check("cmd 端点：半截 JSON 消费丢弃不触发", bus_cmd().status_code == 404
+      and not os.path.isfile(ns["CMD_PATH"]))
 
 print("== 编辑器联动启动 ==")
 check("on_app_started 回调已注册", len(_registered_callbacks) >= 1)
