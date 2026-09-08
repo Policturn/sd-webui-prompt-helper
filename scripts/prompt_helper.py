@@ -465,6 +465,11 @@ def _make_apply_handler(targets, ad_fields=None):
                     continue
                 updates.append(gr.update(value=val))
             _log(f"ADetailer infotext 回填完成（{len(ad_fields)} 组件）")
+        else:
+            # v1.4.6 修复：无 AD 文本时也必须补齐 no-op 更新——事件输出数是
+            # targets + ad_fields，缺段会让 gradio 抛 "didn't receive enough
+            # output values" 并把前段（常规参数）的更新一并丢弃（apply 静默失效）
+            updates.extend(gr.update() for _ in ad_fields)
         return updates
     return handler
 

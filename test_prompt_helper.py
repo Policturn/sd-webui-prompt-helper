@@ -346,6 +346,25 @@ check("apply：越界夹取 / 非法下拉跳过 / 未注册键与 null 不覆�
 with open(ns["PARAMS_PATH"], "w", encoding="utf-8") as f:
     f.write("{{{broken")
 check("apply：params 损坏时全部不覆盖", handler() == [{"__type__": "update"}] * 6)
+
+# v1.4.6 回归：ADetailer 字段并入同一事件后，输出数恒为 targets+ad_fields——
+# adetailer_infotext 缺失/为空时若缺段，gradio 抛 "didn't receive enough output
+# values" 并把常规参数更新一并丢弃（真机冒烟实锤，apply 静默失效）
+ad_a = FakeComp(value="")
+handler_ad = ns["_make_apply_handler"](targets, ad_fields=[(ad_a, "Steps"), (FakeComp(), lambda p: None)])
+with open(ns["PARAMS_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"base": {"width": 512}}, f)
+outs = handler_ad()
+check("apply：无 AD 文本时补齐 no-op 段（输出数 = targets + ad_fields）",
+      len(outs) == 8 and outs[0] == {"__type__": "update", "value": 512}
+      and outs[6:] == [{"__type__": "update"}] * 2)
+with open(ns["PARAMS_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"base": {"width": 512},
+               "adetailer_infotext": "Steps: 20"}, f)
+outs = handler_ad()  # 离线无 infotext_utils → 解析兜底 parsed={} → AD 段全 no-op
+check("apply：有 AD 文本时输出数仍恒为 8（解析失败兜底不缺段）",
+      len(outs) == 8 and outs[0] == {"__type__": "update", "value": 512}
+      and outs[6:] == [{"__type__": "update"}] * 2)
 os.unlink(ns["PARAMS_PATH"])
 
 print("== 生成页总线：postprocess 回传 + ADetailer 内部 pass 防御 ==")
