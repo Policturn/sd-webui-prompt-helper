@@ -506,6 +506,31 @@ with open(ns["CMD_PATH"], "w", encoding="utf-8") as f:
 check("cmd 端点：半截 JSON 消费丢弃不触发", bus_cmd().status_code == 404
       and not os.path.isfile(ns["CMD_PATH"]))
 
+print("== 生成页总线：USDU 脚本选中契约（v1.4.7 平铺 params.usdu.enable）==")
+scriptsel_comp = FakeComp(choices=["None", "Ultimate SD upscale", "Latent"])
+usdu_width = FakeComp(minimum=0, maximum=2048)
+sel_handler = ns["_make_apply_handler"]([
+    ("usdu", "_select", scriptsel_comp, "scriptsel"),
+    ("usdu", "tile_width", usdu_width, "slider_int"),
+])
+with open(ns["PARAMS_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"usdu": {"enable": True, "tile_width": 512}}, f)
+outs = sel_handler()
+check("USDU：enable=true 选中脚本（index 1）+ 字段回填",
+      outs[0] == {"__type__": "update", "value": 1}
+      and outs[1] == {"__type__": "update", "value": 512})
+with open(ns["PARAMS_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"usdu": {"enable": False, "tile_width": 512}}, f)
+outs = sel_handler()
+check("USDU：enable=false 不选中（字段照常回填）",
+      outs[0] == {"__type__": "update"} and outs[1] == {"__type__": "update", "value": 512})
+with open(ns["PARAMS_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"tiled": {"enable": True, "scale": 2}}, f)
+outs = sel_handler()
+check("USDU：usdu 节缺席不选中（与 tiled 平铺节互不干扰）",
+      outs[0] == {"__type__": "update"} and outs[1] == {"__type__": "update"})
+os.unlink(ns["PARAMS_PATH"])
+
 print("== 编辑器联动启动 ==")
 check("on_app_started 回调已注册", len(_registered_callbacks) >= 1)
 ok, msg = ns["launch_editor"]("")

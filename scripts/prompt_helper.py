@@ -47,6 +47,10 @@ v1.4.6 修复 cmd 指令的多消费者竞态：cmd.json 是单槽文件，旧�
 命令被测试页面抢走）。改为服务端原子消费端点 GET /feetag/bus/cmd：先重命名
 到临时名再读删（同卷原子操作，改名成功者独得），每条命令全局恰有一个消费者
 能取到，其余请求得到 404；JS 轮询改调该端点，lastTs 去重保留为双保险。
+
+v1.4.7 修正 USDU 脚本选中契约：params.usdu 节平铺（enable=true 选中脚本 +
+同节字段回填）。旧实现读 params["usdu"]["usdu"] 双重嵌套、与编辑器面板写的
+params.scripts.usdu 互不匹配，Tiled / Tiled VAE / USDU 参数注入从未实际生效。
 """
 
 import base64
@@ -78,7 +82,7 @@ FEETAG_OUT_DIR = os.path.join(EXT_DIR, "featag_out")
 # 默认关闭——词条注入（本插件核心功能）不受影响；排查期防止任何总线副作用。
 ARMED_PATH = os.path.join(EXT_DIR, "bus.armed")
 
-PLUGIN_VERSION = "1.4.6"
+PLUGIN_VERSION = "1.4.7"
 
 CONTROL_KEYS = ("enabled", "path", "negative_path", "merge_lines",
                 "autostart", "editor_path")
@@ -129,9 +133,11 @@ _HIRES_FIELDS = [  # hires 仅文生图；hr_checkpoint（中途换模型）按�
     ("denoise", "txt2img_denoising_strength", "slider_float"),
 ]
 
-# —— M-31b 超分区脚本注入表（v1.4.5）——
+# —— M-31b 超分区脚本注入表（v1.4.5 落地，v1.4.7 起契约与面板对齐）——
 # Tiled Diffusion（multidiffusion 扩展，AlwaysVisible 常驻；tab=txt2img/img2img，
 # 前缀式 uid 与两处后缀式特例并存——已对照源码逐条锁定）：
+# params 契约（v1.4.7）：params.tiled.{enable,...} / params.tiledvae.{...} /
+# params.usdu.{enable,...}（均为平铺节；usdu.enable=true 额外触发脚本下拉选中）
 _TILED_COMMON = [
     ("enable", "MD-{tab}-enabled-checkbox", "checkbox"),          # InputAccordion 隐藏勾选框
     ("method", "MD-{tab}-method", "dropdown"),
@@ -407,9 +413,11 @@ def _make_apply_handler(targets, ad_fields=None):
             if isinstance(section_data, dict) and key in section_data:
                 value = section_data[key]
             if kind == "scriptsel":
-                # USDU 特例：scripts.usdu 出现（enable=true 或带任意字段）→ 选中该脚本
-                usdu = section_data.get("usdu") if isinstance(section_data, dict) else None
-                want = isinstance(usdu, dict) and (usdu.get("enable") is True or len(usdu) > 0)
+                # USDU 特例（v1.4.7 契约修正）：params.usdu.enable=true → 选中该脚本。
+                # 旧实现读 params["usdu"]["usdu"] 双重嵌套且与面板的 params.scripts.usdu
+                # 互不匹配，USDU 参数注入从未实际生效；现契约平铺：usdu 节出现且
+                # enable=true 才选中（OFF / 缺节 = 不选，不影响界面既有选择）
+                want = isinstance(section_data, dict) and section_data.get("enable") is True
                 if want:
                     choices = list(getattr(comp, "choices", []) or [])
                     idx = choices.index(_USDU_SCRIPT_TITLE) if _USDU_SCRIPT_TITLE in choices else -1

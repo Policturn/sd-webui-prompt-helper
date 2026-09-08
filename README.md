@@ -93,7 +93,7 @@ FeeTagHelper 构建区开启"携带元数据"时，txt 末尾会追加一个
 
 | 文件 | 谁写 | 谁读 | 说明 |
 |---|---|---|---|
-| `params.json` | 编辑器 | 插件（apply 时读） | 要覆盖的参数，**只写要改的键**：`base`（width / height / seed / sampler_name / scheduler / steps / cfg_scale / batch_size / n_iter）+ `hires`（enable / upscaler / hr_scale / denoise / steps）；`img2img` / `extras` / `scripts` 段为后续版本预留 |
+| `params.json` | 编辑器 | 插件（apply 时读） | 要覆盖的参数，**只写要改的键**：`base`（width / height / seed / sampler_name / scheduler / steps / cfg_scale / batch_size / n_iter）+ `hires`（enable / upscaler / hr_scale / denoise / steps）+ `tiled` / `tiledvae`（分块放大，enable + 各参数）+ `usdu`（**enable=true 额外触发脚本下拉选中**，v1.4.7 契约平铺）+ `adetailer_infotext`（ADetailer 单行 infotext）；`img2img` / `extras` 段为后续版本预留 |
 | `cmd.json` | 编辑器 | 插件（服务端原子消费） | `{"action":"generate","page":"txt2img","ts":...}`，ts 递增防重放。浏览器 JS 经 `GET /feetag/bus/cmd` 轮询：服务端读取并**删除**该文件，每条命令全局恰有一个消费者取到（200），其余请求 404——多浏览器 / 多页签并存不再竞态抢指令（v1.4.6 修复） |
 | `status.json` | 插件 | 编辑器轮询 | `{"state":"idle/busy/done/error","pass":N,"images":[绝对路径],"error","ts","plugin","choices"}`；内容不变不重写；`choices` 为 WebUI 当前实际可用的采样器 / 调度 / 超分列表（编辑器下拉对齐用）。只读端点 `GET /feetag/bus/status` |
 | `featag_out/` | 插件 | 编辑器 | 每次生成的成品图副本，`fth_年月日_时分秒毫秒_N.png` 命名。只读端点 `GET /feetag/bus/image?name=` |
