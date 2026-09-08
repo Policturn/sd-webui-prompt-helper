@@ -579,6 +579,41 @@ except OSError:
 ns["_on_app_started"]()  # 临时配置 autostart 默认关闭，应直接返回
 check("autostart 关闭时启动回调无动作", True)
 
+print("== editor_path 自动探测（编辑器发版改名根治）==")
+check("版本号解析（v 前缀 / 多段数字 / 无版本号）",
+      ns["_editor_exe_version"]("feetaghelper-v2.7.5.exe") == (2, 7, 5)
+      and ns["_editor_exe_version"]("feetaghelper-v2.6.exe") == (2, 6)
+      and ns["_editor_exe_version"]("feetaghelper-v2.10.0.exe") == (2, 10, 0)
+      and ns["_editor_exe_version"]("feetaghelper.exe") is None)
+
+probe_dir = tempfile.mkdtemp()
+for name in ("feetaghelper-v2.6.0.exe", "feetaghelper-v2.7.5.exe"):
+    open(os.path.join(probe_dir, name), "wb").close()
+stale = os.path.join(probe_dir, "feetaghelper-v2.4.1.exe")
+with open(ns["CONFIG_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"enabled": True, "path": "", "negative_path": "", "merge_lines": True,
+               "autostart": False, "editor_path": stale}, f)
+resolved = ns["_resolve_editor_path"](stale)
+check("失效路径解析到同目录版本号最新的 exe",
+      resolved == os.path.join(probe_dir, "feetaghelper-v2.7.5.exe"))
+check("解析结果已写回 config（下次 UI 直接显示）",
+      json.load(open(ns["CONFIG_PATH"], encoding="utf-8"))["editor_path"] == resolved)
+check("有效路径原样返回", ns["_resolve_editor_path"](resolved) == resolved)
+
+empty_dir = tempfile.mkdtemp()
+gone = os.path.join(empty_dir, "feetaghelper-v2.4.1.exe")
+check("同目录无候选时返回原值", ns["_resolve_editor_path"](gone) == gone)
+missing_dir = os.path.join(probe_dir, "__no_dir__", "feetaghelper-v1.0.0.exe")
+check("目录不存在时返回原值不崩溃", ns["_resolve_editor_path"](missing_dir) == missing_dir)
+
+# 全链路：launch_editor 用失效路径进来，进程探测应拿到解析后的新 exe 名
+# （拦截进程探测避免真拉起，消息里出现新 exe 名即证明整条链路已用解析结果）
+real_process_check = ns["_is_process_running"]
+ns["_is_process_running"] = lambda exe_name: True
+ok, msg = ns["launch_editor"](stale)
+ns["_is_process_running"] = real_process_check
+check("launch_editor 全链路使用解析后的 exe", ok and "feetaghelper-v2.7.5.exe" in msg)
+
 print("== config 读写 ==")
 ns["_save_config"]({"enabled": False, "path": "X", "negative_path": "N",
                     "merge_lines": False, "autostart": True, "editor_path": "Y"})
