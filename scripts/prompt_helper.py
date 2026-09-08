@@ -33,7 +33,12 @@ v1.4.2 起提供「生成」页总线（P1，生成页-实施设计.md）：编�
 （语义键 → elem_id 选择器表见 _FIELD_TABLES，组件经 on_after_component 捕获），
 再由 JS 切页签点生成钮走 UI 队列。每次生成 before_process 置状态 busy、
 postprocess 把成品图存 featag_out/（毫秒时间戳命名）并置 done；ADetailer 内部
-pass（_ad_inner 标记）在所有钩子入口直接 return，不注入不计数不回传。
+pass（_ad_inner 标记的 img2img p2）在所有钩子入口直接 return，不注入不计数不
+回传。v1.4.8 诊断补全：ADetailer postprocess_image 还会对 copy(外层 p) 做两次
+显式钩子重调（真机实证 extensions/adetailer/scripts/!adetailer.py L909/L926，
+copy 只继承外层 p、不带 _ad_inner——这才是 v1.4.5 起防御"未生效"的真因）：
+before_process 以随 p 的 _feetag_pass 标记幂等跳过（浅拷贝自动继承标记），
+postprocess 按 ADetailer 空壳 Processed（images/info 全空）识别跳过。
 status.json（state/pass/images/error/ts + choices）只在内容变化时重写，
 供编辑器轮询；params/cmd 的读取仅在 apply 点击时发生，天然节流。
 
@@ -82,7 +87,7 @@ FEETAG_OUT_DIR = os.path.join(EXT_DIR, "featag_out")
 # 默认关闭——词条注入（本插件核心功能）不受影响；排查期防止任何总线副作用。
 ARMED_PATH = os.path.join(EXT_DIR, "bus.armed")
 
-PLUGIN_VERSION = "1.4.7"
+PLUGIN_VERSION = "1.4.8"
 
 CONTROL_KEYS = ("enabled", "path", "negative_path", "merge_lines",
                 "autostart", "editor_path")
@@ -933,7 +938,14 @@ class PromptHelperScript(scripts.Script):
     def before_process(self, p, enabled, path, negative_path, merge_lines, autostart, editor_path):
         """每次生成任务触发一次，早于提示词列表构建，改 p.prompt 即可全量生效。"""
         if getattr(p, "_ad_inner", False):
-            return  # ADetailer 内部 pass：不注入不计数不写状态（防御行）
+            return  # ADetailer 内部 pass（_ad_inner 的 img2img p2）：不注入不计数不写状态
+        if getattr(p, "_feetag_pass", False):
+            return  # 本 p 已注入过：ADetailer postprocess_image 会拿 copy(外层 p) 重调本钩子
+        #   （真机实证 !adetailer.py L926，copy 无 _ad_inner 标记）——幂等跳过，否则单次
+        #   生成双计数/双注入行/双写配置。标记随 p 存活，每代 p 均为新建对象无需复位；
+        #   代价：同 p 多轮 process_images 的脚本（loopback 类）只在首轮注入（旧版行为
+        #   为每轮叠加注入，本就是错的）。
+        p._feetag_pass = True
         global _gen_pass
         if bus_armed():
             _gen_pass += 1
@@ -985,12 +997,17 @@ class PromptHelperScript(scripts.Script):
     def postprocess(self, p, processed, *args):
         """生成完成：成品图复制到 featag_out/（毫秒时间戳命名）并置状态 done。
 
-        ADetailer 内部 pass 走不到这里（脚本白名单已隔离），此处再防御一次。
+        ADetailer 内部 pass（_ad_inner 标记的 p2）走不到这里（白名单+标记双隔离）；
+        会到达的是它对 copy(外层 p) 的显式重调（真机实证 !adetailer.py L909：
+        need_call_postprocess 时以 Processed(p, [], seed, "") 空壳重调本钩子）——
+        空壳 images/info 全空，由此识别跳过，不再把状态提前置 done。
         总开关关闭时整段跳过（不落图不写状态）。
         任何异常只置 error 状态 + 打日志，绝不影响生成任务本身。
         """
         if getattr(p, "_ad_inner", False) or not bus_armed():
             return
+        if not getattr(processed, "images", None) and not getattr(processed, "info", ""):
+            return  # ADetailer 重调的空壳 Processed：无图可回传，别提前置 done
         try:
             os.makedirs(FEETAG_OUT_DIR, exist_ok=True)
             stamp = time.strftime("%Y%m%d_%H%M%S") + f"{int(time.time() * 1000) % 1000:03d}"

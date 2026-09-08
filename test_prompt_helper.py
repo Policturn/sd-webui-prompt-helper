@@ -393,6 +393,33 @@ script.postprocess(inner_p, FakeProcessed([]))
 check("postprocess：内部 pass 不回传", ns["_gen_pass"] == before_pass
       and not os.listdir(ns["FEETAG_OUT_DIR"]))
 
+# v1.4.8：ADetailer 对 copy(外层 p) 的显式重调（真机实证 !adetailer.py L909/L926）——
+# copy 只继承外层 p（无 _ad_inner），首轮注入打上的 _feetag_pass 随浅拷贝继承，借此识别
+legit_p = FakeP()
+script.before_process(legit_p, True, REAL_TXT, "", True, False, "")  # 合法首轮：注入+计数
+pass_first = ns["_gen_pass"]
+legit_prompt = legit_p.prompt
+check("before_process：首轮注入计数照常", ns["_gen_pass"] == pass_first and "1girl" in legit_prompt)
+
+stray_copy = FakeP()
+stray_copy.prompt = legit_prompt
+stray_copy._feetag_pass = True  # copy.copy(外层 p) 的等价态：属性原样继承
+script.before_process(stray_copy, True, REAL_TXT, "", True, False, "")
+check("before_process：copy(p) 重调幂等跳过（不二次注入不计数）",
+      stray_copy.prompt == legit_prompt and ns["_gen_pass"] == pass_first)
+
+script.before_process(legit_p, True, REAL_TXT, "", True, False, "")
+check("before_process：同一 p 重复触发不叠加注入",
+      legit_p.prompt == legit_prompt and ns["_gen_pass"] == pass_first)
+
+before_status = json.load(open(ns["STATUS_PATH"], encoding="utf-8"))
+before_img_count = len(os.listdir(ns["FEETAG_OUT_DIR"]))
+script.postprocess(stray_copy, FakeProcessed([], info=""))  # ADetailer 空壳：Processed(p, [], seed, "")
+check("postprocess：空壳 Processed 重调不写状态不落图",
+      json.load(open(ns["STATUS_PATH"], encoding="utf-8")) == before_status
+      and len(os.listdir(ns["FEETAG_OUT_DIR"])) == before_img_count)
+before_pass = ns["_gen_pass"]  # 重置基准（上方首轮用例已 +1）
+
 gen_p = FakeP()
 script.before_process(gen_p, True, REAL_TXT, "", True, False, "")
 check("before_process：正常生成置 busy 且计数 +1", ns["_gen_pass"] == before_pass + 1
