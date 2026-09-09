@@ -111,7 +111,7 @@ ARMED_PATH = os.path.join(EXT_DIR, "bus.armed")
 # （用户输入即新的固定值，空值 = 无 pin 回退 config）。已被 .gitignore 排除。
 NEGATIVE_PIN_PATH = os.path.join(EXT_DIR, "negative_path.pin")
 
-PLUGIN_VERSION = "1.4.10"
+PLUGIN_VERSION = "1.4.11"
 
 CONTROL_KEYS = ("enabled", "path", "negative_path", "merge_lines",
                 "autostart", "editor_path")

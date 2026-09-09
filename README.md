@@ -113,6 +113,13 @@ FeeTagHelper 构建区开启"携带元数据"时，txt 末尾会追加一个
 （hr_checkpoint 中途换模型暂不接）。ADetailer 等扩展的内部重绘 pass
 （`_ad_inner` 标记）在插件所有钩子入口直接跳过——不注入词条、不计数、不回传。
 
+轮询心跳（v1.4.11）：JS 的轮询节拍由 **Dedicated Worker 驱动**（Blob URL 内联
+创建，零新增文件）——Worker 定时器不受 Chromium 后台节流影响（页面定时器在
+标签页隐藏后退化为 ≥1s、隐藏超 5 分钟最长 1 分钟一次，曾导致 WebUI 非活跃窗口
+时生成指令被延后消费）；Worker 每 500ms 发心跳，页面收到心跳才执行轮询与
+apply/generate 点击（fetch 与 DOM 操作仍在主线程，消费语义不变）。Worker 不可
+用时自动回退主线程定时器；页面卸载时 terminate。
+
 ### 总开关：bus.armed（v1.4.3+）
 
 总线**默认关闭**：在插件目录放置一个空的 `bus.armed` 文件才启用全部总线行为

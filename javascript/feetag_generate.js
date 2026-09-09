@@ -1,4 +1,4 @@
-// FeeTagHelper 生成页总线 · 浏览器端（v1.4.6，P2）
+// FeeTagHelper 生成页总线 · 浏览器端（v1.4.11）
 //
 // 职责：轮询服务端原子消费端点 /feetag/bus/cmd（编辑器写 cmd.json，服务端
 //   读取并删除——v1.4.6 起不再经 /file= 直读：单槽文件在多浏览器 / 多页签
@@ -11,6 +11,17 @@
 // 总开关（v1.4.3）：插件目录下必须存在 bus.armed 标志文件，本脚本才开始轮询；
 // 未放置时每 15s 静默探测一次（单个 404 请求），零总线流量。放置/删除即生效，
 // 无需刷新页面。
+//
+// Worker 心跳（v1.4.11）：轮询节拍从主线程 setInterval 挪进 Dedicated Worker
+//   （Blob URL 内联创建，零新增文件）。v1.4.10 及以前主线程定时器会被 Chromium
+//   后台节流——标签页隐藏后定时器最少 1s 一次，隐藏超 5 分钟进入 intensive
+//   throttling 最长 1 分钟一次（实测对照见 开发/scripts/scratch/throttle-probe/，
+//   后台 250ms 定时器实测退化为 1~60s），WebUI 窗口非活跃时生成指令被延后消费。
+//   Worker 有独立事件循环、定时器不受页面可见性节流：Worker 每 POLL_MS
+//   postMessage 一次心跳，页面 onmessage 里执行原轮询/消费逻辑（fetch 与
+//   DOM 点击仍在主线程，行为不变；message 事件不属定时器，后台页仍即时派发）。
+//   Worker/Blob 不可用时自动回退主线程定时器（v1.4.10 行为）；页面
+//   pagehide/beforeunload 时 terminate worker。
 //
 // cmd 消费语义（v1.4.6）：每条命令全局恰有一个消费者能取到（服务端先改名再读删，
 // 恰一方 200、其余 404）；本地 lastTs（localStorage，跨页签 + 刷新防重放）保留
@@ -31,7 +42,7 @@
     } catch (e) { /* 保持默认 */ }
 
     var PROBE_MS = 15000;    // bus.armed 探测间隔（未启用态）
-    var POLL_MS = 500;       // cmd.json 轮询间隔（已启用态）
+    var POLL_MS = 500;       // cmd 轮询 / Worker 心跳间隔（已启用态）
     var APPLY_WAIT_MS = 700; // 点 apply 后等 gradio 回填往返的时间
     var SWITCH_WAIT_MS = 150;
     var STORE_KEY = "feetag_last_cmd_ts";
@@ -41,6 +52,10 @@
     try {
         lastTs = window.localStorage.getItem(STORE_KEY); // 跨页签去重 + 刷新后不重放旧指令
     } catch (e) { /* localStorage 不可用则仅内存去重 */ }
+
+    var worker = null;      // v1.4.11 心跳 Worker
+    var mainTimer = null;   // 回退态的主线程节拍定时器
+    var probeCounter = 0;   // 未启用态按节拍折算 15s 探测
 
     function busUrl(name) {
         return "/file=" + BASE_DIR + "/" + name + "?t=" + Date.now();
@@ -118,14 +133,54 @@
             .then(function (res) {
                 if (res.ok && !armed) {
                     armed = true;
-                    console.info("[feetag] 总线已启用（检测到 bus.armed），开始轮询 cmd.json");
-                    setInterval(poll, POLL_MS);
+                    console.info("[feetag] 总线已启用（检测到 bus.armed），开始轮询 /feetag/bus/cmd（Worker 心跳驱动）");
                 }
             })
             .catch(function () { /* 未启用 / 服务未起：静默 */ });
     }
 
-    probe();
-    setInterval(probe, PROBE_MS);
-})();
+    // 统一节拍：armed 走高频轮询，未 armed 按节拍折算 15s 探测（语义与 v1.4.10 一致）
+    function onTick() {
+        if (armed) {
+            poll();
+            return;
+        }
+        probeCounter += 1;
+        if (probeCounter * POLL_MS >= PROBE_MS) {
+            probeCounter = 0;
+            probe();
+        }
+    }
 
+    function stopWorker() {
+        if (!worker) return;
+        try { worker.terminate(); } catch (e) { /* 已终止 */ }
+        worker = null;
+    }
+
+    // Worker/Blob 不可用（极老浏览器等）→ 主线程定时器兜底（v1.4.10 行为，
+    // 后台标签页可能被浏览器节流，属降级而非失效）
+    function fallbackToMainThread() {
+        if (mainTimer || worker) return;
+        mainTimer = setInterval(onTick, POLL_MS);
+        console.info("[feetag] Worker 不可用，已回退主线程定时器");
+    }
+
+    function startWorker() {
+        var heartbeat = "setInterval(function(){ postMessage(1); }, " + POLL_MS + ");";
+        try {
+            var blob = new Blob([heartbeat], { type: "application/javascript" });
+            worker = new Worker(URL.createObjectURL(blob));
+            worker.onmessage = onTick;
+            worker.onerror = function () { stopWorker(); fallbackToMainThread(); };
+        } catch (e) {
+            fallbackToMainThread();
+            return;
+        }
+        // 页面卸载/跳转时终止 Worker，不悬挂线程
+        window.addEventListener("pagehide", stopWorker);
+        window.addEventListener("beforeunload", stopWorker);
+    }
+
+    startWorker();
+})();
