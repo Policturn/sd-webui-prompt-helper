@@ -65,6 +65,16 @@ launch_editor 起始处经 _resolve_editor_path 解析——configured 指向的
 写回 config（下次 UI / 自动启动直接显示新路径）；同目录无候选时返回原值，
 保持"文件不存在"的原有报错行为。进程防重探测（_is_process_running）与最终
 subprocess 均使用解析后的路径。
+
+v1.4.10 根治 negative_path 被旧页面内存值反复回写冲空的问题（before_process
+_save_config 以 UI 值落盘，旧页面持有空反向路径时会把 config 冲回空）：支持
+插件目录根放置 negative_path.pin（纯文本一行=反向词条 txt 完整路径）。读取：
+每次注入现读（一次 stat+read），pin 存在且非空时反向有效路径以 pin 为准、
+无视 config / UI 值；pin 不存在 / 空文件 → 回退 config 原逻辑（零迁移）。
+写入：UI 反向文本框保持可编辑，显示值 = pin 优先；用户提交（.change 持久化
+链路）除写 config 外同步把新值写进 pin 文件（用户输入即新的固定值，空值=
+无 pin 回退 config）。_preview 反向状态行带「（已由 negative_path.pin 固定）」
+标记；放置/修改/删除即刻生效，无需重启。
 """
 
 import base64
@@ -95,8 +105,13 @@ FEETAG_OUT_DIR = os.path.join(EXT_DIR, "featag_out")
 # 总开关（v1.4.3）：bus.armed 存在才启用总线（status/featag_out/apply 回填/JS 轮询）。
 # 默认关闭——词条注入（本插件核心功能）不受影响；排查期防止任何总线副作用。
 ARMED_PATH = os.path.join(EXT_DIR, "bus.armed")
+# 反向词条路径固定文件（v1.4.10）：config 的 negative_path 会被旧页面内存值经
+# before_process _save_config 回写冲空，pin 文件不在该写回链路上、不可被冲掉——
+# 存在且非空时反向有效路径以 pin 为准；UI 反向文本框提交值会同步写回 pin
+# （用户输入即新的固定值，空值 = 无 pin 回退 config）。已被 .gitignore 排除。
+NEGATIVE_PIN_PATH = os.path.join(EXT_DIR, "negative_path.pin")
 
-PLUGIN_VERSION = "1.4.9"
+PLUGIN_VERSION = "1.4.10"
 
 CONTROL_KEYS = ("enabled", "path", "negative_path", "merge_lines",
                 "autostart", "editor_path")
@@ -615,6 +630,25 @@ def _normalize_path(path):
     return os.path.expandvars(os.path.expanduser(path))
 
 
+def _read_negative_pin():
+    """读 negative_path.pin（插件目录根，纯文本一行=反向词条 txt 完整路径）。
+
+    每次注入现读（一次 stat+read），放置/修改/删除即刻生效，无需重启 WebUI。
+    存在且非空 → 返回路径（去引号/首尾空白 + expandvars/expanduser 容错，
+    utf-8 / GBK 双编码兜底）；不存在 / 空文件 / 读取失败 → 返回 ""（调用方
+    回退 config 的 negative_path，零迁移）。背景：config 的 negative_path
+    会被旧页面内存值经 _save_config 反复回写冲空，pin 文件不在该写回链路上、
+    不可被冲掉。
+    """
+    for encoding in ("utf-8-sig", "gb18030"):
+        try:
+            with open(NEGATIVE_PIN_PATH, "r", encoding=encoding) as f:
+                return _normalize_path(f.read())
+        except (OSError, ValueError):
+            continue
+    return ""
+
+
 def read_tag_file(path, merge_lines=True):
     """读取词条文件。返回 (内容或 None, 状态消息)。"""
     path = _normalize_path(path)
@@ -848,15 +882,19 @@ def _preview(path, negative_path, merge_lines):
         parts.append(f"<span style='color:#30a46c'>✓ 正向：{_file_hint(path, text)}{meta_hint}</span>")
 
     neg_preview = ""
-    if _normalize_path(negative_path):
-        neg_text, neg_message = read_tag_file(negative_path, merge_lines)
+    # 反向有效路径：pin 优先（v1.4.10），状态行带生效标记
+    pin_value = _read_negative_pin()
+    neg_effective = pin_value or _normalize_path(negative_path)
+    pin_hint = "（已由 negative_path.pin 固定）" if pin_value else ""
+    if neg_effective:
+        neg_text, neg_message = read_tag_file(neg_effective, merge_lines)
         if neg_text is None:
-            parts.append(f"<span style='color:#e5484d'>✗ 反向：{html.escape(neg_message)}</span>")
+            parts.append(f"<span style='color:#e5484d'>✗ 反向：{html.escape(neg_message)}{pin_hint}</span>")
         else:
             neg_text, neg_metas = strip_meta_tags(neg_text)
             neg_preview = neg_text
             meta_hint = " · 携带元数据" if neg_metas else ""
-            parts.append(f"<span style='color:#30a46c'>✓ 反向：{_file_hint(negative_path, neg_text)}{meta_hint}</span>")
+            parts.append(f"<span style='color:#30a46c'>✓ 反向：{_file_hint(neg_effective, neg_text)}{meta_hint}{pin_hint}</span>")
     else:
         parts.append("<span style='color:#888'>反向：未设置（留空则不注入）</span>")
 
@@ -873,6 +911,18 @@ def _persist_settings(*values):
     _save_config(dict(zip(CONTROL_KEYS, values)))
 
 
+def _persist_negative_pin(value):
+    """反向路径文本框提交值同步写入 negative_path.pin（v1.4.10）：用户输入成为
+    新的固定值；输入为空 → 写空文件（= 无 pin，注入回退 config 逻辑）。
+    独立于 config 持久化事件，写失败只打日志、不影响 config 已照常保存。"""
+    path = _normalize_path(value)
+    try:
+        with open(NEGATIVE_PIN_PATH, "w", encoding="utf-8") as f:
+            f.write(path + "\n" if path else "")
+    except OSError as e:
+        _log(f"negative_path.pin 写入失败（config 已照常保存）：{e}")
+
+
 def _echo(value):
     return value
 
@@ -884,6 +934,10 @@ def _wire_controls(controls, is_img2img):
     for key in CONTROL_KEYS:
         comp = controls[key]
         comp.change(fn=_persist_settings, inputs=inputs, outputs=None)
+        if key == "negative_path":
+            # v1.4.10：反向路径提交值同步写 pin 文件（用户输入即新的固定值，
+            # 空值 = 无 pin 回退 config）；两页面同文件、后写者=最新提交值
+            comp.change(fn=_persist_negative_pin, inputs=[comp], outputs=None)
         if other is not None and key in other:
             comp.change(fn=_echo, inputs=[comp], outputs=[other[key]])
             other[key].change(fn=_echo, inputs=[other[key]], outputs=[comp])
@@ -916,7 +970,7 @@ class PromptHelperScript(scripts.Script):
             )
 
             negative_path = gr.Textbox(
-                value=cfg["negative_path"],
+                value=_read_negative_pin() or cfg["negative_path"],
                 label="反向词条 txt 文件路径（留空则不注入反向）",
                 placeholder="例如：E:\\桌面\\AI file\\Design file\\prompt-helper\\negative.txt",
                 lines=1,
@@ -1031,8 +1085,12 @@ class PromptHelperScript(scripts.Script):
                 shown = tags[:120] + ("…" if len(tags) > 120 else "")
                 _log(f"正向已注入 {injected} 个 tag / {len(tags)} 个字符（{message}）：{shown}")
 
-        if _normalize_path(negative_path):
-            neg_tags, neg_message = read_tag_file(negative_path, merge_lines)
+        # 反向有效路径（v1.4.10）：negative_path.pin 存在且非空时以 pin 为准——
+        # config / UI 值可能已被旧页面内存值经 _save_config 回写冲掉；pin 缺席
+        # 则回退入参（零迁移）。入参仍是 UI 值、回写逻辑不动（有 pin 兜底无害）。
+        neg_effective = _read_negative_pin() or _normalize_path(negative_path)
+        if neg_effective:
+            neg_tags, neg_message = read_tag_file(neg_effective, merge_lines)
             if neg_tags is None:
                 _log(f"反向跳过注入：{neg_message}")
             else:

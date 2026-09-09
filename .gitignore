@@ -6,3 +6,4 @@ cmd.json
 status.json
 featag_out/
 bus.armed
+negative_path.pin

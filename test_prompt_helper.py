@@ -22,7 +22,7 @@ REAL_TXT = r"E:\桌面\AI file\Design file\prompt-helper\prompt.txt"
 # ---- mock gradio / modules.scripts ----
 class _Comp:
     def __init__(self, *args, **kwargs):
-        pass
+        self._change_calls = []  # 记录 .change 接线（kwargs），供 _wire_controls 断言
 
     def __enter__(self):
         return self
@@ -31,7 +31,7 @@ class _Comp:
         return False
 
     def change(self, *args, **kwargs):
-        pass
+        self._change_calls.append(kwargs)
 
     def submit(self, *args, **kwargs):
         pass
@@ -87,6 +87,8 @@ ns["CMD_PATH"] = os.path.join(TMP_DIR, "cmd.json")
 ns["STATUS_PATH"] = os.path.join(TMP_DIR, "status.json")
 ns["FEETAG_OUT_DIR"] = os.path.join(TMP_DIR, "featag_out")
 ns["ARMED_PATH"] = os.path.join(TMP_DIR, "bus.armed")
+# 反向 pin 文件同理重定向到临时目录（真实 pin 若存在会影响既有用例语义）
+ns["NEGATIVE_PIN_PATH"] = os.path.join(TMP_DIR, "negative_path.pin")
 open(ns["ARMED_PATH"], "w").close()
 ns["_status_snapshot"] = None
 
@@ -613,6 +615,60 @@ ns["_is_process_running"] = lambda exe_name: True
 ok, msg = ns["launch_editor"](stale)
 ns["_is_process_running"] = real_process_check
 check("launch_editor 全链路使用解析后的 exe", ok and "feetaghelper-v2.7.5.exe" in msg)
+
+print("== negative_path.pin 固定（config 回写冲空根治，v1.4.10）==")
+check("pin 缺失返回空串（回退 config）", ns["_read_negative_pin"]() == "")
+with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
+    f.write("blurry, bad hands")
+    PIN_NEG = f.name
+with open(ns["NEGATIVE_PIN_PATH"], "w", encoding="utf-8") as f:
+    f.write('  "' + PIN_NEG + '"  \n')
+check("pin 读取 + 引号/空白容错", ns["_read_negative_pin"]() == PIN_NEG)
+
+p = FakeP()
+script.before_process(p, True, REAL_TXT, "", True, False, "")
+check("pin 存在：UI 值为空也注入 pin 指向的反向文件",
+      p.prompt == base + ", masterpiece, best quality"
+      and p.negative_prompt == "blurry, bad hands, lowres"
+      and json.loads(p.extra_generation_params["fth_meta_negative"])["full_text"] == p.negative_prompt)
+p = FakeP()
+script.before_process(p, True, REAL_TXT, r"C:\__other_neg__.txt", True, False, "")
+check("pin 存在：UI 值为别的路径同样以 pin 为准",
+      p.negative_prompt == "blurry, bad hands, lowres")
+
+pos, neg, hint = ns["_preview"](REAL_TXT, "", True)
+check("预览：pin 生效标记（UI 值为空仍预览 pin 文件）",
+      neg == "blurry, bad hands" and "已由 negative_path.pin 固定" in hint)
+pos, neg, hint = ns["_preview"](REAL_TXT, r"C:\__other_neg__.txt", True)
+check("预览：pin 优先于 UI 值", neg == "blurry, bad hands"
+      and "已由 negative_path.pin 固定" in hint)
+
+box_controls = {key: _Comp() for key in ns["CONTROL_KEYS"]}
+ns["_wire_controls"](box_controls, False)
+pin_fns = [call.get("fn") for call in box_controls["negative_path"]._change_calls]
+enabled_fns = [call.get("fn") for call in box_controls["enabled"]._change_calls]
+check("UI 接线：反向文本框 change 挂 pin 写入、其他控件不挂",
+      ns["_persist_negative_pin"] in pin_fns and ns["_persist_negative_pin"] not in enabled_fns)
+ns["_persist_negative_pin"](PIN_NEG)
+check("UI 提交：新值写入 pin 文件", ns["_read_negative_pin"]() == PIN_NEG)
+ns["_persist_negative_pin"]("")
+check("UI 空提交：pin 写空文件（= 无 pin 回退 config）",
+      os.path.isfile(ns["NEGATIVE_PIN_PATH"])
+      and open(ns["NEGATIVE_PIN_PATH"], encoding="utf-8").read() == ""
+      and ns["_read_negative_pin"]() == "")
+
+p = FakeP()
+script.before_process(p, True, REAL_TXT, "", True, False, "")
+check("pin 空：UI 值为空则不注入反向", p.negative_prompt == "lowres"
+      and "fth_meta_negative" not in p.extra_generation_params)
+p = FakeP()
+script.before_process(p, True, REAL_TXT, PIN_NEG, True, False, "")
+check("pin 空：回退 UI 值照常注入", p.negative_prompt == "blurry, bad hands, lowres")
+pos, neg, hint = ns["_preview"](REAL_TXT, "", True)
+check("预览：pin 拆除后回退未设置提示", neg == "" and "未设置" in hint
+      and "固定" not in hint)
+os.unlink(PIN_NEG)
+os.remove(ns["NEGATIVE_PIN_PATH"])  # 还原无 pin 态，后续用例不受影响
 
 print("== config 读写 ==")
 ns["_save_config"]({"enabled": False, "path": "X", "negative_path": "N",
