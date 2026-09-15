@@ -75,6 +75,20 @@ _save_config 以 UI 值落盘，旧页面持有空反向路径时会把 config �
 链路）除写 config 外同步把新值写进 pin 文件（用户输入即新的固定值，空值=
 无 pin 回退 config）。_preview 反向状态行带「（已由 negative_path.pin 固定）」
 标记；放置/修改/删除即刻生效，无需重启。
+
+v1.4.12 设置固定升级为统一 settings.pin（JSON，任意 config 键子集，六键
+enabled / path / negative_path / merge_lines / autostart / editor_path 全
+覆盖），替代逐键独立 pin 文件：读取优先级逐键 settings.pin > 旧独立 pin
+（negative_path.pin / positive_path.pin 作迁移兼容并入，老用户文件原样可读）
+> config（零迁移）。根治 config 各键被旧页面内存值经 _save_config 反复回写
+冲掉的问题（path 与 negative_path / editor_path 同族）。UI 六个控件初始值
+= pin 覆盖后的有效值（_effective_config）；任一控件提交（.change 持久化链）
+除写 config 外经 _persist_pin_key 把该键固化进 settings.pin（用户显式操作=
+固化意图；路径键空值 = 从 pin 删该键回退 config 并同步清空对应旧独立 pin
+文件，防止解除固定被旧文件顶回；布尔键恒写显式值）。before_process /
+_preview / launch_editor / 自动启动全部消费点统一走 pin 有效值；_preview
+状态行带「（已由 settings.pin 固定）」标记（经旧独立 pin 固定则显示对应
+文件名）。每次现读、即刻生效，无需重启。
 """
 
 import base64
@@ -105,13 +119,19 @@ FEETAG_OUT_DIR = os.path.join(EXT_DIR, "featag_out")
 # 总开关（v1.4.3）：bus.armed 存在才启用总线（status/featag_out/apply 回填/JS 轮询）。
 # 默认关闭——词条注入（本插件核心功能）不受影响；排查期防止任何总线副作用。
 ARMED_PATH = os.path.join(EXT_DIR, "bus.armed")
-# 反向词条路径固定文件（v1.4.10）：config 的 negative_path 会被旧页面内存值经
-# before_process _save_config 回写冲空，pin 文件不在该写回链路上、不可被冲掉——
-# 存在且非空时反向有效路径以 pin 为准；UI 反向文本框提交值会同步写回 pin
-# （用户输入即新的固定值，空值 = 无 pin 回退 config）。已被 .gitignore 排除。
+# 统一设置固定文件（v1.4.12）：settings.pin（JSON，任意 config 键子集）。config
+# 全部六键会被旧页面内存值经 _save_config 反复回写冲掉（path / negative_path /
+# editor_path 同族问题），pin 文件不在该写回链路上、不可被冲掉——文件里出现的
+# 键以 pin 为准；UI 任一控件提交值经 _persist_pin_key 固化进该文件（路径键
+# 空值 = 解除该键固定回退 config）。已被 .gitignore 排除。
+SETTINGS_PIN_PATH = os.path.join(EXT_DIR, "settings.pin")
+# 旧独立 pin（v1.4.10 机制，保留作迁移兼容读取层——老用户已有该文件）：存在且
+# 非空时并入 _read_pin_overrides（settings.pin 同键优先于它）；UI 提交经
+# _persist_pin_key 同步更新（若文件存在），防止"解除固定"被旧文件顶回。
 NEGATIVE_PIN_PATH = os.path.join(EXT_DIR, "negative_path.pin")
+POSITIVE_PIN_PATH = os.path.join(EXT_DIR, "positive_path.pin")
 
-PLUGIN_VERSION = "1.4.11"
+PLUGIN_VERSION = "1.4.12"
 
 CONTROL_KEYS = ("enabled", "path", "negative_path", "merge_lines",
                 "autostart", "editor_path")
@@ -630,23 +650,80 @@ def _normalize_path(path):
     return os.path.expandvars(os.path.expanduser(path))
 
 
-def _read_negative_pin():
-    """读 negative_path.pin（插件目录根，纯文本一行=反向词条 txt 完整路径）。
-
-    每次注入现读（一次 stat+read），放置/修改/删除即刻生效，无需重启 WebUI。
-    存在且非空 → 返回路径（去引号/首尾空白 + expandvars/expanduser 容错，
-    utf-8 / GBK 双编码兜底）；不存在 / 空文件 / 读取失败 → 返回 ""（调用方
-    回退 config 的 negative_path，零迁移）。背景：config 的 negative_path
-    会被旧页面内存值经 _save_config 反复回写冲空，pin 文件不在该写回链路上、
-    不可被冲掉。
-    """
+def _read_pin_file(path):
+    """读单行路径 pin 文件（旧独立 pin 机制，v1.4.10）。存在且非空 → 返回路径
+    （去引号/首尾空白 + expandvars/expanduser 容错，utf-8 / GBK 双编码兜底）；
+    不存在 / 空文件 / 读取失败 → 返回 ""。"""
     for encoding in ("utf-8-sig", "gb18030"):
         try:
-            with open(NEGATIVE_PIN_PATH, "r", encoding=encoding) as f:
+            with open(path, "r", encoding=encoding) as f:
                 return _normalize_path(f.read())
         except (OSError, ValueError):
             continue
     return ""
+
+
+def _read_negative_pin():
+    """读 negative_path.pin（v1.4.10 旧机制读取接口原样保留，现为
+    _read_pin_overrides 的兼容层——老用户已有该文件）。"""
+    return _read_pin_file(NEGATIVE_PIN_PATH)
+
+
+def _read_pin_json(path):
+    """读 JSON pin 文件（settings.pin）。缺失 / 损坏 / 非对象 → 返回 {}，
+    不抛错；utf-8 / GBK 双编码兜底（与单行 pin 同款容错）。"""
+    for encoding in ("utf-8-sig", "gb18030"):
+        try:
+            with open(path, "r", encoding=encoding) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        return data if isinstance(data, dict) else {}
+    return {}
+
+
+def _read_pin_overrides():
+    """读统一固定文件 settings.pin（JSON，任意 config 键子集）并合并旧独立 pin。
+
+    读取优先级（逐键）：settings.pin > 旧独立 pin（negative_path.pin /
+    positive_path.pin，迁移兼容）> config（调用方回退，零迁移）。每次现读
+    （一次 stat+read），放置/修改/删除即刻生效，无需重启 WebUI。返回仅含
+    CONTROL_KEYS 内的键；路径键空值视作未固定（不遮蔽旧独立 pin / config），
+    布尔键原样透传（调用方按键语义强转）。
+    """
+    overrides = {}
+    for pin_path, key in ((NEGATIVE_PIN_PATH, "negative_path"),
+                          (POSITIVE_PIN_PATH, "path")):
+        value = _read_pin_file(pin_path)
+        if value:
+            overrides[key] = value
+    for key, value in _read_pin_json(SETTINGS_PIN_PATH).items():
+        if key not in CONTROL_KEYS:
+            continue
+        if key in ("path", "negative_path", "editor_path"):
+            value = _normalize_path(str(value or ""))
+            if not value:
+                continue  # 空值 = 该键未固定，勿遮蔽旧独立 pin / config
+        overrides[key] = value
+    return overrides
+
+
+def _effective_config():
+    """config 经 settings.pin 逐键覆盖后的有效配置（v1.4.12 六键统一）。
+
+    UI 初始值 / 自动启动等消费点统一走它：pin 里出现的键以 pin 为准（含旧
+    独立 pin 兼容层），缺席键保持 config 原值；类型强转与 _load_config 同款。
+    """
+    cfg = _load_config()
+    overrides = _read_pin_overrides()
+    for key in CONTROL_KEYS:
+        if key in overrides:
+            cfg[key] = overrides[key]
+    for key in ("enabled", "merge_lines", "autostart"):
+        cfg[key] = bool(cfg[key])
+    for key in ("path", "negative_path", "editor_path"):
+        cfg[key] = str(cfg[key] or "")
+    return cfg
 
 
 def read_tag_file(path, merge_lines=True):
@@ -822,7 +899,16 @@ def _resolve_editor_path(configured):
 
 
 def launch_editor(editor_path):
-    """启动外部词条编辑器（独立进程，关闭 WebUI 不会连带关闭它）。返回 (是否成功, 消息)。"""
+    """启动外部词条编辑器（独立进程，关闭 WebUI 不会连带关闭它）。返回 (是否成功, 消息)。
+
+    v1.4.12：settings.pin 的 editor_path 键存在时以 pin 为准——先于
+    _resolve_editor_path 应用（在 config / UI 值之上），失效自动探测照常接管：
+    探测结果写回 config，pin 原值保持，每次启动都经探测重解析，编辑器发版
+    exe 改名不断链（v1.4.9 机制不受影响）。
+    """
+    overrides = _read_pin_overrides()
+    if overrides.get("editor_path"):
+        editor_path = overrides["editor_path"]
     editor_path = _resolve_editor_path(editor_path)
     if not editor_path:
         return False, "未设置编辑器路径"
@@ -868,33 +954,51 @@ def _record_meta_png(p, meta, key, fields):
         pass  # 记录失败不影响生成
 
 
+def _pin_fixed_hint(key, overrides):
+    """预览状态行的固定标记（v1.4.12）：settings.pin 优先显示，经旧独立 pin
+    固定则显示对应文件名（v1.4.10 文案保留）；未固定返回空。"""
+    if key not in overrides:
+        return ""
+    if key in _read_pin_json(SETTINGS_PIN_PATH):
+        return "（已由 settings.pin 固定）"
+    legacy = {"path": "positive_path.pin", "negative_path": "negative_path.pin"}.get(key)
+    return f"（已由 {legacy} 固定）" if legacy else ""
+
+
 def _preview(path, negative_path, merge_lines):
     parts = []
+
+    # settings.pin 统一固定（v1.4.12）：逐键覆盖入参（UI 值），状态行带固定标记
+    overrides = _read_pin_overrides()
+    if overrides.get("path"):
+        path = overrides["path"]
+    if overrides.get("negative_path"):
+        negative_path = overrides["negative_path"]
+    if "merge_lines" in overrides:
+        merge_lines = bool(overrides["merge_lines"])
+    pos_hint = _pin_fixed_hint("path", overrides)
+    neg_hint = _pin_fixed_hint("negative_path", overrides)
 
     text, message = read_tag_file(path, merge_lines)
     if text is None:
         pos_preview = ""
-        parts.append(f"<span style='color:#e5484d'>✗ 正向：{html.escape(message)}</span>")
+        parts.append(f"<span style='color:#e5484d'>✗ 正向：{html.escape(message)}{pos_hint}</span>")
     else:
         text, metas = strip_meta_tags(text)
         pos_preview = text
         meta_hint = " · 携带元数据" if metas else ""
-        parts.append(f"<span style='color:#30a46c'>✓ 正向：{_file_hint(path, text)}{meta_hint}</span>")
+        parts.append(f"<span style='color:#30a46c'>✓ 正向：{_file_hint(path, text)}{meta_hint}{pos_hint}</span>")
 
     neg_preview = ""
-    # 反向有效路径：pin 优先（v1.4.10），状态行带生效标记
-    pin_value = _read_negative_pin()
-    neg_effective = pin_value or _normalize_path(negative_path)
-    pin_hint = "（已由 negative_path.pin 固定）" if pin_value else ""
-    if neg_effective:
-        neg_text, neg_message = read_tag_file(neg_effective, merge_lines)
+    if _normalize_path(negative_path):
+        neg_text, neg_message = read_tag_file(negative_path, merge_lines)
         if neg_text is None:
-            parts.append(f"<span style='color:#e5484d'>✗ 反向：{html.escape(neg_message)}{pin_hint}</span>")
+            parts.append(f"<span style='color:#e5484d'>✗ 反向：{html.escape(neg_message)}{neg_hint}</span>")
         else:
             neg_text, neg_metas = strip_meta_tags(neg_text)
             neg_preview = neg_text
             meta_hint = " · 携带元数据" if neg_metas else ""
-            parts.append(f"<span style='color:#30a46c'>✓ 反向：{_file_hint(neg_effective, neg_text)}{meta_hint}{pin_hint}</span>")
+            parts.append(f"<span style='color:#30a46c'>✓ 反向：{_file_hint(negative_path, neg_text)}{meta_hint}{neg_hint}</span>")
     else:
         parts.append("<span style='color:#888'>反向：未设置（留空则不注入）</span>")
 
@@ -911,16 +1015,53 @@ def _persist_settings(*values):
     _save_config(dict(zip(CONTROL_KEYS, values)))
 
 
-def _persist_negative_pin(value):
-    """反向路径文本框提交值同步写入 negative_path.pin（v1.4.10）：用户输入成为
-    新的固定值；输入为空 → 写空文件（= 无 pin，注入回退 config 逻辑）。
-    独立于 config 持久化事件，写失败只打日志、不影响 config 已照常保存。"""
-    path = _normalize_path(value)
+# 路径键（布尔键恒写显式值；路径键空值 = 解除固定）
+_PATH_PIN_KEYS = ("path", "negative_path", "editor_path")
+
+
+def _legacy_pin_file(key):
+    """该路径键对应的旧独立 pin 文件（v1.4.10 机制）；editor_path 无旧文件。"""
+    return {"path": POSITIVE_PIN_PATH, "negative_path": NEGATIVE_PIN_PATH}.get(key)
+
+
+def _persist_pin_key(key, value):
+    """控件提交值固化进 settings.pin 对应键（v1.4.12 统一固定机制）。
+
+    读-改-写整个 JSON（文件缺失 / 损坏视作 {}）：路径键（path / negative_path /
+    editor_path）空值 = 从 pin 删除该键（回退 config），非空写归一化路径；
+    布尔键恒写显式值（含 False——用户取消勾选同样是固化意图）。若该路径键
+    存在旧独立 pin 文件，同步更新之（写值 / 清空），防止"解除固定"被旧文件
+    顶回。独立于 config 持久化事件，写失败只打日志、不影响 config 已照常保存。
+    """
+    data = _read_pin_json(SETTINGS_PIN_PATH)
+    if key in _PATH_PIN_KEYS:
+        normalized = _normalize_path(value)
+        if normalized:
+            data[key] = normalized
+        else:
+            data.pop(key, None)
+        legacy = _legacy_pin_file(key)
+        if legacy and os.path.isfile(legacy):
+            try:
+                with open(legacy, "w", encoding="utf-8") as f:
+                    f.write(normalized + "\n" if normalized else "")
+            except OSError as e:
+                _log(f"{os.path.basename(legacy)} 写入失败（settings.pin 已照常处理）：{e}")
+    else:
+        data[key] = bool(value)
     try:
-        with open(NEGATIVE_PIN_PATH, "w", encoding="utf-8") as f:
-            f.write(path + "\n" if path else "")
+        with open(SETTINGS_PIN_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
     except OSError as e:
-        _log(f"negative_path.pin 写入失败（config 已照常保存）：{e}")
+        _log(f"settings.pin 写入失败（config 已照常保存）：{e}")
+
+
+def _make_pin_persister(key):
+    """生成某控件的 settings.pin 写入处理器（闭包绑定键名，v1.4.12 统一接线：
+    两页面同文件、后写者=最新提交值）。"""
+    def handler(value):
+        _persist_pin_key(key, value)
+    return handler
 
 
 def _echo(value):
@@ -934,10 +1075,9 @@ def _wire_controls(controls, is_img2img):
     for key in CONTROL_KEYS:
         comp = controls[key]
         comp.change(fn=_persist_settings, inputs=inputs, outputs=None)
-        if key == "negative_path":
-            # v1.4.10：反向路径提交值同步写 pin 文件（用户输入即新的固定值，
-            # 空值 = 无 pin 回退 config）；两页面同文件、后写者=最新提交值
-            comp.change(fn=_persist_negative_pin, inputs=[comp], outputs=None)
+        # v1.4.12 统一 pin：任一控件提交值除写 config 外同步固化进 settings.pin
+        # （用户显式操作 = 固化意图；路径键空值 = 解除该键固定回退 config）
+        comp.change(fn=_make_pin_persister(key), inputs=[comp], outputs=None)
         if other is not None and key in other:
             comp.change(fn=_echo, inputs=[comp], outputs=[other[key]])
             other[key].change(fn=_echo, inputs=[other[key]], outputs=[comp])
@@ -953,7 +1093,8 @@ class PromptHelperScript(scripts.Script):
         return scripts.AlwaysVisible
 
     def ui(self, is_img2img):
-        cfg = _load_config()
+        # v1.4.12：六控件初始值 = settings.pin 覆盖后的有效值（pin 优先显示）
+        cfg = _effective_config()
 
         with gr.Accordion("外部提示词注入（实时读取 txt）", open=False,
                           elem_id=f"prompt-helper-{'img2img' if is_img2img else 'txt2img'}"):
@@ -970,7 +1111,7 @@ class PromptHelperScript(scripts.Script):
             )
 
             negative_path = gr.Textbox(
-                value=_read_negative_pin() or cfg["negative_path"],
+                value=cfg["negative_path"],
                 label="反向词条 txt 文件路径（留空则不注入反向）",
                 placeholder="例如：E:\\桌面\\AI file\\Design file\\prompt-helper\\negative.txt",
                 lines=1,
@@ -1063,6 +1204,20 @@ class PromptHelperScript(scripts.Script):
             _write_status("busy")
         _save_config(dict(zip(CONTROL_KEYS, (enabled, path, negative_path,
                                               merge_lines, autostart, editor_path))))
+        # settings.pin 统一固定（v1.4.12）：逐键覆盖入参（UI 值）——config 各键会被
+        # 旧页面内存值经 _save_config 反复回写冲掉（path 与 negative_path 同族），
+        # pin 不在该写回链路上、不可被冲掉；上方 _save_config 保存的仍是入参原值
+        # （pin 兜底回写无害，同 v1.4.10 反向语义）。autostart / editor_path 在
+        # _on_app_started / launch_editor 消费点覆盖，此处不参与生成行为。
+        overrides = _read_pin_overrides()
+        if "enabled" in overrides:
+            enabled = bool(overrides["enabled"])
+        if overrides.get("path"):
+            path = overrides["path"]
+        if overrides.get("negative_path"):
+            negative_path = overrides["negative_path"]
+        if "merge_lines" in overrides:
+            merge_lines = bool(overrides["merge_lines"])
         if not enabled:
             return
 
@@ -1085,12 +1240,10 @@ class PromptHelperScript(scripts.Script):
                 shown = tags[:120] + ("…" if len(tags) > 120 else "")
                 _log(f"正向已注入 {injected} 个 tag / {len(tags)} 个字符（{message}）：{shown}")
 
-        # 反向有效路径（v1.4.10）：negative_path.pin 存在且非空时以 pin 为准——
-        # config / UI 值可能已被旧页面内存值经 _save_config 回写冲掉；pin 缺席
-        # 则回退入参（零迁移）。入参仍是 UI 值、回写逻辑不动（有 pin 兜底无害）。
-        neg_effective = _read_negative_pin() or _normalize_path(negative_path)
-        if neg_effective:
-            neg_tags, neg_message = read_tag_file(neg_effective, merge_lines)
+        # 反向有效路径：已在上方经 settings.pin 统一覆盖（v1.4.10 的独立 pin
+        # 机制并入 _read_pin_overrides 兼容层；pin 缺席则回退入参，零迁移）。
+        if _normalize_path(negative_path):
+            neg_tags, neg_message = read_tag_file(negative_path, merge_lines)
             if neg_tags is None:
                 _log(f"反向跳过注入：{neg_message}")
             else:
@@ -1221,7 +1374,9 @@ def _on_app_started(demo=None, app=None):
         except OSError:
             pass
         _write_status("idle")  # 总线启用时发初态（含 choices），编辑器据此判断插件在线
-    cfg = _load_config()
+    # v1.4.12：自动启动消费点走 pin 覆盖后的有效配置（autostart / editor_path
+    # 六键统一；launch_editor 内部还会再过一次 pin，手动改 pin 即刻生效）
+    cfg = _effective_config()
     if not cfg["autostart"]:
         return
     ok, message = launch_editor(cfg["editor_path"])

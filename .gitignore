@@ -7,3 +7,5 @@ status.json
 featag_out/
 bus.armed
 negative_path.pin
+positive_path.pin
+settings.pin

@@ -87,8 +87,11 @@ ns["CMD_PATH"] = os.path.join(TMP_DIR, "cmd.json")
 ns["STATUS_PATH"] = os.path.join(TMP_DIR, "status.json")
 ns["FEETAG_OUT_DIR"] = os.path.join(TMP_DIR, "featag_out")
 ns["ARMED_PATH"] = os.path.join(TMP_DIR, "bus.armed")
-# 反向 pin 文件同理重定向到临时目录（真实 pin 若存在会影响既有用例语义）
+# pin 文件同理重定向到临时目录（真实 pin 若存在会影响既有用例语义）：
+# 统一 settings.pin + 旧独立 pin（negative/positive）三份
 ns["NEGATIVE_PIN_PATH"] = os.path.join(TMP_DIR, "negative_path.pin")
+ns["POSITIVE_PIN_PATH"] = os.path.join(TMP_DIR, "positive_path.pin")
+ns["SETTINGS_PIN_PATH"] = os.path.join(TMP_DIR, "settings.pin")
 open(ns["ARMED_PATH"], "w").close()
 ns["_status_snapshot"] = None
 
@@ -616,59 +619,157 @@ ok, msg = ns["launch_editor"](stale)
 ns["_is_process_running"] = real_process_check
 check("launch_editor 全链路使用解析后的 exe", ok and "feetaghelper-v2.7.5.exe" in msg)
 
-print("== negative_path.pin 固定（config 回写冲空根治，v1.4.10）==")
-check("pin 缺失返回空串（回退 config）", ns["_read_negative_pin"]() == "")
+print("== settings.pin 统一固定（六键全覆盖，v1.4.12；旧独立 pin 兼容层）==")
+check("pin 缺失：overrides 为空（回退 config）", ns["_read_pin_overrides"]() == {})
 with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
     f.write("blurry, bad hands")
     PIN_NEG = f.name
+with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
+    f.write("1girl, smile")
+    PIN_POS = f.name
+with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
+    f.write("worst quality, jpeg")
+    PIN_NEG2 = f.name
+
+# —— 旧独立 pin 兼容层（v1.4.10 文件原样可读，读取语义不变）——
+check("_read_negative_pin 旧接口保留（现兼容层）", ns["_read_negative_pin"]() == "")
 with open(ns["NEGATIVE_PIN_PATH"], "w", encoding="utf-8") as f:
     f.write('  "' + PIN_NEG + '"  \n')
-check("pin 读取 + 引号/空白容错", ns["_read_negative_pin"]() == PIN_NEG)
+check("旧 negative_path.pin：引号/空白容错并入 overrides",
+      ns["_read_pin_overrides"]() == {"negative_path": PIN_NEG})
+with open(ns["POSITIVE_PIN_PATH"], "w", encoding="gbk") as f:
+    f.write(PIN_POS)
+check("旧 positive_path.pin：GBK 兜底并入 overrides",
+      ns["_read_pin_overrides"]() == {"negative_path": PIN_NEG, "path": PIN_POS})
 
+# —— settings.pin：六键全覆盖 + 表外键忽略 + 同键优先于旧独立 pin ——
+with open(ns["SETTINGS_PIN_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"path": PIN_POS, "negative_path": PIN_NEG2, "enabled": True,
+               "merge_lines": True, "autostart": True,
+               "editor_path": r"C:\__pin_editor__.exe", "unknown_key": 1}, f)
+ov = ns["_read_pin_overrides"]()
+check("settings.pin：六键全读取 + 表外键忽略",
+      set(ov) == set(ns["CONTROL_KEYS"])
+      and ov["path"] == PIN_POS and ov["enabled"] is True
+      and ov["merge_lines"] is True and ov["autostart"] is True
+      and ov["editor_path"] == r"C:\__pin_editor__.exe")
+check("settings.pin：同键优先于旧独立 pin（negative_path）", ov["negative_path"] == PIN_NEG2)
+with open(ns["SETTINGS_PIN_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"path": "   ", "negative_path": PIN_NEG2}, f)
+check("settings.pin：路径键空值视作未固定（不遮蔽旧独立 pin / config）",
+      ns["_read_pin_overrides"]() == {"negative_path": PIN_NEG2, "path": PIN_POS})
+
+# —— before_process：pin 逐键覆盖入参（UI / config 值）——
+with open(ns["SETTINGS_PIN_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"path": PIN_POS, "negative_path": PIN_NEG2}, f)
 p = FakeP()
-script.before_process(p, True, REAL_TXT, "", True, False, "")
-check("pin 存在：UI 值为空也注入 pin 指向的反向文件",
-      p.prompt == base + ", masterpiece, best quality"
-      and p.negative_prompt == "blurry, bad hands, lowres"
+script.before_process(p, True, "", "", True, False, "")
+check("pin 生效：UI 正反向为空仍注入 pin 指向文件",
+      p.prompt == "1girl, smile, masterpiece, best quality"
+      and p.negative_prompt == "worst quality, jpeg, lowres"
+      and json.loads(p.extra_generation_params["fth_meta"])["full_text"] == p.prompt
       and json.loads(p.extra_generation_params["fth_meta_negative"])["full_text"] == p.negative_prompt)
 p = FakeP()
-script.before_process(p, True, REAL_TXT, r"C:\__other_neg__.txt", True, False, "")
-check("pin 存在：UI 值为别的路径同样以 pin 为准",
-      p.negative_prompt == "blurry, bad hands, lowres")
+script.before_process(p, True, r"C:\__other_pos__.txt", r"C:\__other_neg__.txt", True, False, "")
+check("pin 生效：UI 值为别的路径同样以 pin 为准",
+      p.prompt == "1girl, smile, masterpiece, best quality"
+      and p.negative_prompt == "worst quality, jpeg, lowres")
+with open(ns["SETTINGS_PIN_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"path": PIN_POS, "negative_path": PIN_NEG2, "enabled": False}, f)
+p = FakeP()
+script.before_process(p, True, PIN_POS, PIN_NEG2, True, False, "")
+check("pin 生效：enabled 固定 False 覆盖 UI 勾选（六键全覆盖）",
+      p.prompt == "masterpiece, best quality" and p.negative_prompt == "lowres"
+      and not p.extra_generation_params)
+with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
+    f.write("a,\nb")
+    ML_TXT = f.name
+with open(ns["SETTINGS_PIN_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"path": ML_TXT, "merge_lines": False}, f)
+p = FakeP()
+script.before_process(p, True, ML_TXT, "", True, False, "")
+check("pin 生效：merge_lines 固定 False 覆盖 UI True（换行保留）",
+      p.prompt == "a,\nb, masterpiece, best quality")
+os.unlink(ML_TXT)
 
-pos, neg, hint = ns["_preview"](REAL_TXT, "", True)
-check("预览：pin 生效标记（UI 值为空仍预览 pin 文件）",
-      neg == "blurry, bad hands" and "已由 negative_path.pin 固定" in hint)
-pos, neg, hint = ns["_preview"](REAL_TXT, r"C:\__other_neg__.txt", True)
-check("预览：pin 优先于 UI 值", neg == "blurry, bad hands"
-      and "已由 negative_path.pin 固定" in hint)
+# —— _preview：固定标记（settings.pin 优先，旧独立 pin 文案保留）——
+with open(ns["SETTINGS_PIN_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"path": PIN_POS, "negative_path": PIN_NEG2}, f)
+pos, neg, hint = ns["_preview"]("", "", True)
+check("预览：settings.pin 固定标记（双路径键）",
+      pos == "1girl, smile" and neg == "worst quality, jpeg"
+      and hint.count("已由 settings.pin 固定") == 2)
+with open(ns["SETTINGS_PIN_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"path": PIN_POS}, f)
+pos, neg, hint = ns["_preview"]("", "", True)
+check("预览：settings.pin 拆键后旧独立 pin 接管并显示其标记",
+      neg == "blurry, bad hands" and "已由 negative_path.pin 固定" in hint
+      and "已由 settings.pin 固定" in hint)
 
+# —— UI 接线：六控件各挂独立 pin 写入处理器 ——
 box_controls = {key: _Comp() for key in ns["CONTROL_KEYS"]}
 ns["_wire_controls"](box_controls, False)
-pin_fns = [call.get("fn") for call in box_controls["negative_path"]._change_calls]
-enabled_fns = [call.get("fn") for call in box_controls["enabled"]._change_calls]
-check("UI 接线：反向文本框 change 挂 pin 写入、其他控件不挂",
-      ns["_persist_negative_pin"] in pin_fns and ns["_persist_negative_pin"] not in enabled_fns)
-ns["_persist_negative_pin"](PIN_NEG)
-check("UI 提交：新值写入 pin 文件", ns["_read_negative_pin"]() == PIN_NEG)
-ns["_persist_negative_pin"]("")
-check("UI 空提交：pin 写空文件（= 无 pin 回退 config）",
-      os.path.isfile(ns["NEGATIVE_PIN_PATH"])
-      and open(ns["NEGATIVE_PIN_PATH"], encoding="utf-8").read() == ""
-      and ns["_read_negative_pin"]() == "")
+persister = {}
+for key, comp in box_controls.items():
+    fns = [c.get("fn") for c in comp._change_calls if c.get("fn") is not ns["_persist_settings"]]
+    check(f"UI 接线：{key} 控件挂恰一个独立 pin 写入", len(fns) == 1)
+    persister[key] = fns[0]
+persister["path"](PIN_POS)
+check("UI 提交：新值固化进 settings.pin 对应键",
+      ns["_read_pin_overrides"]()["path"] == PIN_POS)
+persister["enabled"](False)
+check("UI 提交：布尔键恒写显式值（False 亦固化）",
+      ns["_read_pin_overrides"]()["enabled"] is False)
 
+# —— _persist_pin_key：路径键空提交删键 + 同步清旧独立 pin ——
+ns["_persist_pin_key"]("negative_path", PIN_NEG)
+check("persist：路径键写归一化值 + 已存在的旧 negative_path.pin 同步",
+      ns["_read_pin_overrides"]()["negative_path"] == PIN_NEG
+      and open(ns["NEGATIVE_PIN_PATH"], encoding="utf-8").read().strip() == PIN_NEG)
+ns["_persist_pin_key"]("negative_path", "")
+check("persist：路径键空提交删键 + 清空旧 pin（回退 config）",
+      "negative_path" not in ns["_read_pin_overrides"]()
+      and open(ns["NEGATIVE_PIN_PATH"], encoding="utf-8").read() == "")
+ns["_persist_pin_key"]("path", "")
+check("persist：正向键空提交删键 + 清空旧 positive_path.pin",
+      "path" not in ns["_read_pin_overrides"]()
+      and open(ns["POSITIVE_PIN_PATH"], encoding="utf-8").read() == "")
+
+# —— _effective_config：UI 初始值 / 自动启动消费点 ——
+with open(ns["SETTINGS_PIN_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"enabled": False, "path": PIN_POS, "merge_lines": False}, f)
+with open(ns["CONFIG_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"enabled": True, "path": r"C:\cfg.txt", "negative_path": r"C:\cfgneg.txt",
+               "merge_lines": True, "autostart": False, "editor_path": r"C:\cfg_ed.exe"}, f)
+check("有效配置：pin 逐键覆盖、缺席键回退 config",
+      ns["_effective_config"]() == {"enabled": False, "path": PIN_POS,
+                                    "negative_path": r"C:\cfgneg.txt", "merge_lines": False,
+                                    "autostart": False, "editor_path": r"C:\cfg_ed.exe"})
+
+# —— launch_editor：editor_path 键存在以 pin 为准（先于失效自动探测）——
+with open(ns["SETTINGS_PIN_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"editor_path": PIN_POS}, f)
+real_process_check = ns["_is_process_running"]
+ns["_is_process_running"] = lambda exe_name: True
+ok, msg = ns["launch_editor"](r"C:\__ui_editor__.exe")
+ns["_is_process_running"] = real_process_check
+check("launch_editor：editor_path 在 pin 时以 pin 为准（UI 值被覆盖）",
+      ok and os.path.basename(PIN_POS) in msg)
+
+# —— 拆除 pin：回退 config 原逻辑（零迁移）——
+for pin_path in (ns["SETTINGS_PIN_PATH"], ns["NEGATIVE_PIN_PATH"], ns["POSITIVE_PIN_PATH"]):
+    os.remove(pin_path)
+check("拆除全部 pin 后 overrides 复位为空", ns["_read_pin_overrides"]() == {})
 p = FakeP()
-script.before_process(p, True, REAL_TXT, "", True, False, "")
-check("pin 空：UI 值为空则不注入反向", p.negative_prompt == "lowres"
-      and "fth_meta_negative" not in p.extra_generation_params)
-p = FakeP()
-script.before_process(p, True, REAL_TXT, PIN_NEG, True, False, "")
-check("pin 空：回退 UI 值照常注入", p.negative_prompt == "blurry, bad hands, lowres")
-pos, neg, hint = ns["_preview"](REAL_TXT, "", True)
-check("预览：pin 拆除后回退未设置提示", neg == "" and "未设置" in hint
-      and "固定" not in hint)
+script.before_process(p, True, PIN_POS, PIN_NEG2, True, False, "")
+check("pin 拆除：回退 UI 值照常注入", p.prompt == "1girl, smile, masterpiece, best quality"
+      and p.negative_prompt == "worst quality, jpeg, lowres")
+pos, neg, hint = ns["_preview"]("", "", True)
+check("预览：pin 拆除后回退未设置提示（无固定标记）",
+      pos == "" and "未设置" in hint and "固定" not in hint)
 os.unlink(PIN_NEG)
-os.remove(ns["NEGATIVE_PIN_PATH"])  # 还原无 pin 态，后续用例不受影响
+os.unlink(PIN_POS)
+os.unlink(PIN_NEG2)
 
 print("== config 读写 ==")
 ns["_save_config"]({"enabled": False, "path": "X", "negative_path": "N",

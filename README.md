@@ -36,13 +36,31 @@ git clone https://github.com/Policturn/sd-webui-prompt-helper extensions/sd-webu
 
 - **每次生成读一次文件**：点一次"生成"读一次；队列 / 批量任务每个任务各读
   一次，始终获取编辑器输出的最新内容，中途改词条无需刷新页面。
-- **negative_path.pin 固定文件（v1.4.10）**：插件目录根可放置 `negative_path.pin`
-  （纯文本一行=反向词条 txt 完整路径）——存在且非空时反向注入以 pin 为准，
-  不再受 config / 页面旧值回写影响（config 的 negative_path 曾被旧页面内存值
-  反复回写冲空）。反向路径文本框显示值 = pin 优先；在框内改路径并提交会**同步
-  写回 pin 文件**（清空提交 = 撤销固定、回退 config）。注入 / 预览每次现读，
-  改 pin 即刻生效无需重启；预览状态行显示「（已由 negative_path.pin 固定）」
-  标记。该文件含个人路径，已被 .gitignore 排除。
+- **settings.pin 统一固定文件（v1.4.12）**：插件目录根可放置 `settings.pin`
+  （JSON，内容为任意设置键子集，六键 `enabled` / `path` / `negative_path` /
+  `merge_lines` / `autostart` / `editor_path` 全支持）——文件里出现的键以 pin
+  为准，不再受 config / 页面旧值回写影响（config 各键曾被旧页面内存值反复
+  回写冲掉，`path` / `negative_path` / `editor_path` 同族）。推荐直接手编该
+  文件固化设置，例如：
+
+  ```json
+  {
+    "path": "E:\\词条\\prompt.txt",
+    "negative_path": "E:\\词条\\negative.txt",
+    "enabled": true
+  }
+  ```
+
+  读取优先级（逐键）：**settings.pin > 旧独立 pin > config**；注入 / 预览 /
+  编辑器启动每次现读，改文件即刻生效无需重启；预览状态行显示
+  「（已由 settings.pin 固定）」标记。UI 各控件初始值 = pin 覆盖后的有效值；
+  在页面上改动任一设置并提交会**同步固化进 settings.pin**（用户显式操作 =
+  固化意图；路径框清空提交 = 解除该键固定、回退 config；布尔开关恒写显式值）。
+  该文件含个人路径，已被 .gitignore 排除。
+- **旧独立 pin 文件（兼容层）**：v1.4.10 的 `negative_path.pin`（纯文本一行=
+  反向词条 txt 完整路径）原样可读，`positive_path.pin` 同款亦并入——同键时
+  `settings.pin` 优先于它们；UI 提交会同步更新已存在的旧 pin 文件（含清空），
+  防止"解除固定"被旧文件顶回。新用户直接用 `settings.pin` 即可，无需旧文件。
 - **正向 / 反向双文件**：反向词条来自独立的 txt 文件，与正向互不影响——
   一方读取失败不影响另一方注入；反向路径留空则只注入正向。
 - **注入位置固定在最前**（v1.4.1 起位置确定化）：词条恒定拼接在提示词最前面，
