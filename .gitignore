@@ -9,3 +9,5 @@ bus.armed
 negative_path.pin
 positive_path.pin
 settings.pin
+*.tmp-*
+*.consuming-*

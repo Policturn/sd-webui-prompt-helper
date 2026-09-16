@@ -154,6 +154,21 @@ setTimeout 盲等被 Chromium 节流到 ~3s+，压缩前 write→busy 实测 3.5
 收到心跳才执行轮询与 apply/generate 点击（fetch 与 DOM 操作仍在主线程，消费
 语义不变）。Worker 不可用时自动回退主线程定时器；页面卸载时 terminate。
 
+鲁棒性（v1.4.16，盲测 P1 修复）：
+
+- **接线分组分线**：未安装 Tiled Diffusion / Ultimate SD upscale 扩展的环境，
+  `tiled` / `tiledvae` / `usdu` 参数节整组跳过（启动日志有提示），base /
+  hires 等原生参数照常回填——apply 不再因扩展缺席而永不接线（旧版会静默
+  用界面旧值出图）。params.json 契约（v1.4.7 平铺）不变。
+- **Reload UI 兼容**：A1111 的 Reload UI / Restart Gradio 重建界面后自动
+  重新接线（旧版一旦 Reload UI，apply 静默死亡直到重启进程）。
+- **总线看门狗**：生成任务异常结束（不触发 postprocess）时，status.json
+  约 10 秒内补写 `error` 状态（含明确消息）——按"任务是否仍在运行"判定
+  而非超时，小时级的慢生成（大图 tiled 超分）不受影响。
+- **原子写**：config.json / settings.pin / status.json 等一律"临时文件 +
+  原子替换"落盘（替换窗口的短暂占用自动重试），编辑器面板与配置读取
+  不会再见到半截 JSON。
+
 ### 总开关：bus.armed（v1.4.3+）
 
 总线**默认关闭**：在插件目录放置一个空的 `bus.armed` 文件才启用全部总线行为

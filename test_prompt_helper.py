@@ -58,8 +58,10 @@ scripts_mod.AlwaysVisible = object()
 callbacks_mod = types.ModuleType("modules.script_callbacks")
 _registered_callbacks = []
 _after_component_cbs = []
+_before_ui_cbs = []
 callbacks_mod.on_app_started = lambda cb, name=None: _registered_callbacks.append(cb)
 callbacks_mod.on_after_component = lambda cb, name=None: _after_component_cbs.append(cb)
+callbacks_mod.on_before_ui = lambda cb, name=None: _before_ui_cbs.append(cb)
 
 modules_pkg = types.ModuleType("modules")
 modules_pkg.scripts = scripts_mod
@@ -694,6 +696,195 @@ outs = sel_handler()
 check("USDU：usdu 节缺席不选中（与 tiled 平铺节互不干扰）",
       outs[0] == {"__type__": "update"} and outs[1] == {"__type__": "update"})
 os.unlink(ns["PARAMS_PATH"])
+
+print("== 生成页总线：可选扩展组分组分线（v1.4.16 盲测 P1-1）==")
+# 离线 mock 无 A1111 脚本注册表（scripts_txt2img / scripts_img2img 缺席）
+# → 可选组（tiled / tiledvae / usdu）判定为"未安装"，裁剪而非死等
+check("离线无注册表：可选组判定为未安装（裁剪而非死等）",
+      ns["_section_available"](False, "tiled") is False)
+
+
+class FakeButton:
+    def __init__(self):
+        self.click_kwargs = None
+
+    def click(self, *args, **kwargs):
+        self.click_kwargs = kwargs
+
+
+bare_btn = FakeButton()
+ns["_BUS_BUTTONS"][False] = bare_btn
+for section, _key, elem_id, _kind in ns["_FIELD_TABLES"][False]:
+    if section in ("base", "hires"):
+        cb(FakeComp(elem_id=elem_id))
+base_hires_count = sum(1 for r in ns["_FIELD_TABLES"][False] if r[0] in ("base", "hires"))
+check("未装扩展：base+hires 到齐即接线（不再被可选组拖死 → apply 静默失效根治）",
+      ns["_WIRED"].get(False) is True and bare_btn.click_kwargs is not None)
+check("裁剪后输出数 = base+hires（可选组整组剔除）",
+      len(bare_btn.click_kwargs["outputs"]) == base_hires_count)
+bare_handler = bare_btn.click_kwargs["fn"]
+with open(ns["PARAMS_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"base": {"width": 768}, "tiled": {"enable": True, "scale": 2}}, f)
+outs = bare_handler()
+check("裁剪后 apply：base 照常回填（v1.4.7 平铺契约不变，可选组键自然忽略）",
+      outs[0] == {"__type__": "update", "value": 768}
+      and len(outs) == base_hires_count)
+os.unlink(ns["PARAMS_PATH"])
+
+# 扩展已安装：伪 runner 注册 title 后，组件未到齐前等待、到齐后全字段接线
+class _FakeScript:
+    def __init__(self, title):
+        self.title = title
+
+
+class _FakeRunner:
+    def __init__(self, titles):
+        self.scripts = [_FakeScript(t) for t in titles]
+
+
+ns["_WIRED"].clear()
+ns["_SECTION_STATE"].clear()
+scripts_mod.scripts_txt2img = _FakeRunner(["Tiled Diffusion", "Tiled VAE"])
+scripts_mod.scripts_img2img = _FakeRunner(["Tiled Diffusion", "Tiled VAE", "Ultimate SD upscale"])
+try:
+    check("注册表有扩展：可选组判定为在场", ns["_section_available"](False, "tiled") is True)
+    full_btn = FakeButton()
+    ns["_BUS_BUTTONS"][False] = full_btn
+    for section, _key, elem_id, _kind in ns["_FIELD_TABLES"][False]:
+        if section in ("base", "hires"):
+            cb(FakeComp(elem_id=elem_id))
+    check("扩展在场但组件未到：继续等待不接线（等待分支语义保持）",
+          ns["_WIRED"].get(False) is None)
+    for section, _key, elem_id, _kind in ns["_FIELD_TABLES"][False]:
+        if section in ("tiled", "tiledvae"):
+            cb(FakeComp(elem_id=elem_id))
+    check("可选组组件到齐后接线（全字段，含 MD 组件）",
+          ns["_WIRED"].get(False) is True
+          and len(full_btn.click_kwargs["outputs"]) == len(ns["_FIELD_TABLES"][False]))
+finally:
+    del scripts_mod.scripts_txt2img
+    del scripts_mod.scripts_img2img
+
+print("== Reload UI 接线复位（v1.4.16 盲测 P1-2）==")
+check("on_before_ui 回调已注册", len(_before_ui_cbs) >= 1)
+ns["_SCRIPT_LISTS"].extend([FakeComp(elem_id="script_list"), FakeComp(elem_id="script_list")])
+_before_ui_cbs[-1]()
+check("Reload UI：接线/组件捕获/脚本下拉/按钮/组判定/页面控件表全部复位",
+      not ns["_WIRED"] and not ns["_UI_COMPONENTS"] and not ns["_SCRIPT_LISTS"]
+      and not ns["_SECTION_STATE"] and not ns["_BUS_BUTTONS"] and not ns["_TAB_CONTROLS"])
+# 模拟重建：新按钮 + base/hires 组件重新捕获 → 重新接线
+# （修复前 _WIRED=True 永不复位：新 apply 钮永不接线，静默死亡直到重启进程）
+re_btn = FakeButton()
+ns["_BUS_BUTTONS"][False] = re_btn
+for section, _key, elem_id, _kind in ns["_FIELD_TABLES"][False]:
+    if section in ("base", "hires"):
+        cb(FakeComp(elem_id=elem_id))
+check("重建后接线恢复（陈旧组件引用已清，不误接旧对象）",
+      ns["_WIRED"].get(False) is True and re_btn.click_kwargs is not None)
+
+print("== 总线看门狗（v1.4.16 盲测 P1-4：生成异常补写 error）==")
+ns["_gen_pass"] = 0
+ns["_status_snapshot"] = None
+ns["_status_last"] = {"state": "idle", "images": None, "error": None, "adetailer": None}
+ns["_write_status"]("busy")
+check("busy + 判定链路不可用（离线 mock 无 shared）→ 不误判（宁可不写）",
+      ns["_bus_watchdog_tick"]() is False)
+modules_pkg.shared = types.SimpleNamespace(state=types.SimpleNamespace(job="Txt2Img"))
+try:
+    check("busy + 生成任务运行中 → 不误判（小时级慢生成不受伤，活性判定非超时）",
+          ns["_bus_watchdog_tick"]() is False)
+    modules_pkg.shared = types.SimpleNamespace(state=types.SimpleNamespace(job=""))
+    check("busy + 无运行中任务 → 判定卡死", ns["_bus_watchdog_tick"]() is True)
+    check("首轮判定只计数不写 error（宽限一轮防瞬态）",
+          ns["_bus_watchdog_step"](0) == 1
+          and json.load(open(ns["STATUS_PATH"], encoding="utf-8"))["state"] == "busy")
+    check("连续第二次判定达阈值 → 写 error 并归零",
+          ns["_bus_watchdog_step"](1) == 0
+          and json.load(open(ns["STATUS_PATH"], encoding="utf-8"))["state"] == "error")
+finally:
+    del modules_pkg.shared
+check("error 态不再触发看门狗（不重复写）", ns["_bus_watchdog_tick"]() is False)
+
+print("== 原子写：config / status 半截读根治（v1.4.16 盲测 P1 ④）==")
+ns["_save_config"]({"enabled": True, "path": "P", "negative_path": "",
+                    "merge_lines": True, "autostart": False, "editor_path": ""})
+check("save_config 原子写：内容完整且无 .tmp- 残留",
+      json.load(open(ns["CONFIG_PATH"], encoding="utf-8"))["path"] == "P"
+      and not [n for n in os.listdir(TMP_DIR) if ".tmp-" in n])
+
+
+def _boom_replace(src, dst):
+    raise OSError("replace failed (simulated)")
+
+
+_orig_replace = os.replace
+os.replace = _boom_replace
+try:
+    ns["_save_config"]({"enabled": False, "path": "Q", "negative_path": "",
+                        "merge_lines": True, "autostart": False, "editor_path": ""})
+    ns["_write_status"]("done", images=["x.png"])
+finally:
+    os.replace = _orig_replace
+check("replace 失败：旧 config 完整保留（不再有截断窗口）",
+      json.load(open(ns["CONFIG_PATH"], encoding="utf-8"))["path"] == "P")
+check("replace 失败：status 保持旧值 + 临时文件已清理",
+      json.load(open(ns["STATUS_PATH"], encoding="utf-8"))["state"] == "error"
+      and not [n for n in os.listdir(TMP_DIR) if ".tmp-" in n])
+
+# 并发写：双线程交替全量保存 + 并发读者。读者语义与 status 端点一致——
+# PermissionError 是原子替换窗口的短暂句柄拒绝（重读即愈，非半截），
+# ValueError（半截 JSON）或持续拒绝才是真失败
+_read_errors = []
+_stop = {"flag": False}
+
+
+def _writer(tag):
+    for i in range(40):
+        ns["_save_config"]({"enabled": True, "path": f"{tag}{i}", "negative_path": "",
+                            "merge_lines": True, "autostart": False, "editor_path": ""})
+
+
+def _read_full(path, tries=6):
+    for attempt in range(tries):
+        try:
+            with open(path, encoding="utf-8") as f:
+                json.load(f)
+            return None
+        except PermissionError:
+            time.sleep(0.005)
+        except (OSError, ValueError) as e:
+            return f"{type(e).__name__}: {e}"
+    return "PermissionError 持续超过重试上限"
+
+
+def _concurrent_reader():
+    while not _stop["flag"]:
+        err = _read_full(ns["CONFIG_PATH"])
+        if err:
+            _read_errors.append(err)
+        time.sleep(0.001)
+
+
+writers = [threading.Thread(target=_writer, args=(t,)) for t in ("A", "B")]
+reader_t = threading.Thread(target=_concurrent_reader)
+for t in writers:
+    t.start()
+reader_t.start()
+for t in writers:
+    t.join(10)
+_stop["flag"] = True
+reader_t.join(5)
+check("并发写 config：读者全程零半截（写锁串行 + 原子替换，短暂拒绝经重读自愈）",
+      not _read_errors and not [n for n in os.listdir(TMP_DIR) if ".tmp-" in n])
+
+# settings.pin / 旧独立 pin 同一原子通道
+ns["_persist_pin_key"]("editor_path", r"E:\pin\editor.exe")
+check("settings.pin 原子写往返 + 无残留",
+      ns["_read_pin_overrides"]().get("editor_path") == r"E:\pin\editor.exe"
+      and not [n for n in os.listdir(TMP_DIR) if ".tmp-" in n])
+ns["_persist_pin_key"]("editor_path", "")
+check("settings.pin 解除固定后 overrides 复位",
+      "editor_path" not in ns["_read_pin_overrides"]())
 
 print("== 编辑器联动启动 ==")
 check("on_app_started 回调已注册", len(_registered_callbacks) >= 1)

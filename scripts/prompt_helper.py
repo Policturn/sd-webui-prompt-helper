@@ -111,6 +111,28 @@ p.prompt 页面基底不动，日志带「（快照锁定）」标注）——�
 读失败 → 回落现状读 txt，语义不变。params.json 只被编辑器覆盖写、无删除方，
 生成轮内（写 params+cmd → apply → 点生成 → before_process）无下一轮覆盖窗口，
 轮末读盘安全；读一次小 json 的开销可接受。
+
+v1.4.16 盲测 P1×4 修复：
+① 接线分组分线——未安装 Tiled Diffusion / Ultimate SD upscale 扩展的环境，
+  旧版「全有或全无」等全部字段组件到齐才接线，可选组组件永不出现 → apply
+  永不接线且零日志，JS 仍照常点生成钮，参数静默停留在界面旧值（总线核心
+  功能被废）。现 base / hires（A1111 原生组件）为硬依赖；可选组
+  （tiled / tiledvae / usdu）经 A1111 脚本注册表判定在场，未装则整组裁剪并
+  打日志（apply handler 对 params 缺组键本就跳过，v1.4.7 平铺契约不变）。
+② Reload UI 接线复位——A1111 重建界面（webui.py 主循环 before_ui_callback
+  → create_ui）会重跑全部脚本 ui()，模块级 _WIRED=True 不复位导致新 apply
+  钮永不接线（apply 静默死亡直到重启进程），_SCRIPT_LISTS 等持旧引用无界
+  累加；on_before_ui 回调复位全部捕获状态，重建后重新接线。
+③ 总线看门狗——生成任务异常路径不触发 postprocess，status 永久卡 busy、
+  无 error 写出（编辑器只能靠自身超时兜底）。守护线程按任务活性判定：
+  shared.state.job 已清空而状态仍 busy、连续两轮（约 10s）才写 error——
+  数小时的慢生成（大图 tiled 超分）不会误伤；判定链路不可用时宁可不写
+  （退回编辑器侧 120s 超时兜底）。
+④ 配置 / 状态文件原子写——config.json / settings.pin / 旧独立 pin /
+  status.json 的写入改经 _atomic_write_text（同目录临时文件 + os.replace
+  原子落盘），config 族读写并持 _config_lock 串行：读者（编辑器面板轮询、
+  下次 _load_config）不再可能读到半截 JSON，崩溃 / 并发写不再有截断窗口
+  （positive path 被半截 config 静默清空的风险根除）。
 """
 
 import base64
@@ -153,7 +175,7 @@ SETTINGS_PIN_PATH = os.path.join(EXT_DIR, "settings.pin")
 NEGATIVE_PIN_PATH = os.path.join(EXT_DIR, "negative_path.pin")
 POSITIVE_PIN_PATH = os.path.join(EXT_DIR, "positive_path.pin")
 
-PLUGIN_VERSION = "1.4.15"
+PLUGIN_VERSION = "1.4.16"
 
 CONTROL_KEYS = ("enabled", "path", "negative_path", "merge_lines",
                 "autostart", "editor_path")
@@ -255,6 +277,19 @@ _USDU_FIELDS = [
 _USDU_SCRIPT_TITLE = "Ultimate SD upscale"
 _USDU_SCRIPT_LIST_ID = "script_list"   # txt2img/img2img 各渲染一份（按创建序区分页）
 
+# 可选扩展组（v1.4.16 分组分线，盲测 P1-1）：组名 → 依赖的扩展脚本标题
+# （A1111 脚本注册表 runner.scripts 里脚本对象的 title，已对照 H 盘 1.10.1
+# 扩展源码逐条核实）。未装扩展的环境组内组件永不出现——旧版「全有或全无」
+# 会让 apply 永不接线，故按注册表判定后整组裁剪。base / hires 为 A1111
+# 原生组件，硬依赖（未到齐 = 页面仍在构建，继续等）。
+_OPTIONAL_SECTIONS = {
+    "tiled": "Tiled Diffusion",
+    "tiledvae": "Tiled VAE",
+    "usdu": "Ultimate SD upscale",
+}
+# (页, 组) → 扩展在场与否 的判定缓存（on_before_ui 时清空，UI 重建后重判）
+_SECTION_STATE = {}
+
 
 def _field_table(is_img2img):
     """某页的可覆盖字段表：[(总线分区, 语义键, elem_id, 组件类型)]。"""
@@ -298,6 +333,11 @@ _status_last = {"state": "idle", "images": None, "error": None, "adetailer": Non
 # cmd.json 原子消费锁（v1.4.6）：fastapi 线程池并发处理 GET /feetag/bus/cmd，
 # 锁 + 改名保证"读后即删"退路也只可能有一个赢家
 _cmd_lock = threading.Lock()
+# config 族文件写锁（v1.4.16）：config.json（_save_config 的全量写 /
+# _resolve_editor_path 的读-改-写回）与 settings.pin / 旧独立 pin 的写入
+# 可能来自生成线程（before_process）与 UI 线程（控件提交 / 启动按钮）并发，
+# 串行化 + _atomic_write_text 原子落盘共同消灭半截文件
+_config_lock = threading.Lock()
 
 
 def bus_armed():
@@ -423,8 +463,8 @@ def _write_status(state, images=None, error=None, adetailer=None, applied_ts=Non
         if adetailer is not None:
             payload["adetailer"] = adetailer
         try:
-            with open(STATUS_PATH, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False)
+            # v1.4.16 原子落盘：编辑器高频轮询本文件，临时文件 + replace 消灭半截读
+            _atomic_write_text(STATUS_PATH, json.dumps(payload, ensure_ascii=False))
             _status_snapshot = signature
             _status_last = {"state": state, "images": images,
                             "error": error, "adetailer": adetailer}
@@ -446,6 +486,74 @@ def _mark_applied():
     last = _status_last
     _write_status(last["state"], images=last["images"], error=last["error"],
                   adetailer=last["adetailer"], applied_ts=int(time.time() * 1000))
+
+
+# ---------------------------------------------------------------------------
+# 总线看门狗（v1.4.16，盲测 P1-4：生成异常时 status 永久卡 busy 的 error 写出）
+# ---------------------------------------------------------------------------
+
+# 巡检周期（秒）与写 error 所需的连续异常判定次数（2 次 × 5s ≈ 10s 宽限——
+# 判定依据是任务活性而非超时，慢生成不受影响，宽限只防瞬态误读）
+_WATCHDOG_INTERVAL = 5.0
+_WATCHDOG_TRIES = 2
+_watchdog_started = False
+
+
+def _bus_watchdog_tick():
+    """看门狗单次判定：status 为 busy 但 A1111 已无运行中的生成任务
+    （shared.state.job 已清空，而 postprocess 未被调用——生成异常路径不触发
+    postprocess，状态永久卡 busy）→ 返回 True。
+
+    判定依据是任务活性而非耗时：数小时的慢生成（大图 tiled 超分）期间
+    state.job 恒非空，不会被误伤；判定链路不可用（modules.shared 导入失败 /
+    属性缺失，如离线 mock）返回 False——宁可不写 error，编辑器侧自有
+    120s 超时兜底，看门狗只是把兜底提前并给出明确 error 消息。"""
+    if not bus_armed() or _status_last.get("state") != "busy":
+        return False
+    try:
+        from modules import shared
+        job = getattr(shared.state, "job", None)
+    except Exception:
+        return False
+    if job is None:
+        return False
+    return not job
+
+
+def _bus_watchdog_step(consecutive):
+    """看门狗单步推进（供循环线程与离线直测）：入参 = 已连续判定的异常次数，
+    返回新的连续计数；达到 _WATCHDOG_TRIES 时写 error 并归零。自身异常绝不
+    外抛（看门狗不得影响任何生成行为）。"""
+    try:
+        if _bus_watchdog_tick():
+            consecutive += 1
+            if consecutive >= _WATCHDOG_TRIES:
+                _write_status("error", error="生成任务异常结束（postprocess 未被调用，"
+                                              "看门狗检测：总线 busy 但已无运行中的生成任务）")
+                consecutive = 0
+        else:
+            consecutive = 0
+    except Exception:
+        consecutive = 0
+    return consecutive
+
+
+def _bus_watchdog_loop():
+    consecutive = 0
+    while True:
+        time.sleep(_WATCHDOG_INTERVAL)
+        consecutive = _bus_watchdog_step(consecutive)
+
+
+def _start_bus_watchdog():
+    """启动总线看门狗守护线程（每进程一次，_on_app_started 调用；Reload UI
+    会再次触发 app_started，经 _watchdog_started 幂等防重）。"""
+    global _watchdog_started
+    if _watchdog_started:
+        return
+    _watchdog_started = True
+    threading.Thread(target=_bus_watchdog_loop, name="feetag-bus-watchdog",
+                     daemon=True).start()
 
 
 def _coerce_value(kind, value, comp):
@@ -486,21 +594,65 @@ def _coerce_value(kind, value, comp):
     return text
 
 
+def _section_available(is_img2img, section):
+    """可选扩展组在场判定（v1.4.16 分组分线）：查 A1111 脚本注册表——两个
+    runner（scripts_txt2img / scripts_img2img）的 scripts 列表按脚本 title
+    精确匹配；注册表在 UI 组件创建之前已填充，判定与组件创建时序无关。
+    结果按 (页, 组) 缓存到 _SECTION_STATE（_on_before_ui 清空）。注册表不可
+    读（A1111 接口变化 / 离线 mock）按在场处理——保持等待而非裁剪，宁可不
+    接线也不静默丢组（此时退化为旧版全有或全无行为，不劣化）。"""
+    key = (is_img2img, section)
+    if key not in _SECTION_STATE:
+        title = _OPTIONAL_SECTIONS[section]
+        found = False
+        try:
+            from modules import scripts as a1111_scripts
+            for attr in ("scripts_txt2img", "scripts_img2img"):
+                runner = getattr(a1111_scripts, attr, None)
+                for script in getattr(runner, "scripts", None) or []:
+                    if getattr(script, "title", None) == title:
+                        found = True
+                        break
+                if found:
+                    break
+        except Exception:
+            found = True
+        _SECTION_STATE[key] = found
+    return _SECTION_STATE[key]
+
+
 def _try_wire_page(is_img2img):
-    """延迟接线：该页全部目标组件捕获齐全 + 按钮已创建时，注册 apply/ADetailer 事件。
-    幂等（每页只接一次）；由 _on_after_component 与 ui() 末尾共同触发。"""
+    """延迟接线：该页目标组件捕获齐全 + 按钮已创建时，注册 apply/ADetailer 事件。
+
+    幂等（每页每轮 UI 只接一次）；由 _on_after_component 与 ui() 末尾共同触发。
+    v1.4.16 分组分线（盲测 P1-1 修复）：旧版要求该页字段表全部到齐才接线——
+    未安装 Tiled Diffusion / Ultimate SD upscale 扩展的环境（演示机、其他
+    接收方）可选组组件永不出现，apply 永不接线且零日志，JS 仍照常点生成钮，
+    参数静默停留在界面旧值。现 base / hires（A1111 原生组件）保持硬依赖
+    ——未到齐说明页面仍在构建，继续等；可选组（tiled / tiledvae / usdu）
+    经 _section_available 判定：未安装则整组裁剪并打日志，已安装则继续等
+    其组件创建（扩展脚本的 ui() 可能晚于本脚本）。裁剪只影响回填的输出
+    组件列表，apply handler 对 params 对应节本就「缺键跳过」，v1.4.7 平铺
+    契约不变。"""
     if _WIRED.get(is_img2img) or is_img2img not in _BUS_BUTTONS:
         return
-    wanted = [row[2] for row in _FIELD_TABLES[is_img2img]]
-    missing = [e for e in wanted if e not in _UI_COMPONENTS]
+    rows = _FIELD_TABLES[is_img2img]
+    unavailable = [s for s in _OPTIONAL_SECTIONS
+                   if any(r[0] == s for r in rows)
+                   and not _section_available(is_img2img, s)]
+    rows = [r for r in rows if r[0] not in unavailable]
+    missing = [e for _s, _k, e, _t in rows if e not in _UI_COMPONENTS]
+    usdu_active = is_img2img and "usdu" not in unavailable
+    if usdu_active and len(_SCRIPT_LISTS) < 2:
+        missing.append("script_list")  # USDU 选中依赖的脚本下拉（两页各一份）尚未捕获齐
     if missing:
         return
     tab = "img2img" if is_img2img else "txt2img"
     targets = []
-    if is_img2img and len(_SCRIPT_LISTS) > 1:
+    if usdu_active:
         targets.append(("usdu", "_select", _SCRIPT_LISTS[1], "scriptsel"))
     targets += [(section, key, _UI_COMPONENTS[elem_id], kind)
-                for section, key, elem_id, kind in _FIELD_TABLES[is_img2img]]
+                for section, key, elem_id, kind in rows]
     ad_fields = _AD_FIELDS.get(is_img2img) or []
     # ADetailer 回填并入同一事件（单事件双段更新）——独立第二按钮的接线在部分
     # 页面不可靠（config 实测 txt2img AD 依赖缺失），合并后彻底消除该变量
@@ -509,7 +661,14 @@ def _try_wire_page(is_img2img):
     apply_btn.click(fn=_make_apply_handler(targets, ad_fields), inputs=[],
                     outputs=outputs, show_progress=False, queue=False)
     _WIRED[is_img2img] = True
-    _log(f"生成页（{tab}）总线已接线：apply {len(targets)} 项输出 + ADetailer 回填 {len(ad_fields)} 项（同一事件）")
+    if unavailable:
+        skipped = "、".join(f"params.{s}（扩展「{_OPTIONAL_SECTIONS[s]}」未安装）"
+                            for s in unavailable)
+        _log(f"生成页（{tab}）总线已接线：apply {len(targets)} 项输出 + "
+             f"ADetailer 回填 {len(ad_fields)} 项（同一事件）；整组跳过 {skipped}")
+    else:
+        _log(f"生成页（{tab}）总线已接线：apply {len(targets)} 项输出 + "
+             f"ADetailer 回填 {len(ad_fields)} 项（同一事件）")
 
 
 def _make_apply_handler(targets, ad_fields=None):
@@ -689,17 +848,53 @@ def _log(message):
     print(f"[prompt-helper] {message}")
 
 
+def _atomic_write_text(path, text):
+    """原子写文本文件（v1.4.16，共享函数）：先写同目录临时文件再 os.replace
+    覆盖目标（同卷原子操作，Windows / Linux 均原子）。读者（编辑器面板轮询 /
+    下次 _load_config）只会看到完整的旧版或新版内容，不会读到半截；进程在
+    写入中途崩溃也只会留下临时文件、目标保持旧版。
+
+    Windows 细节：目标正被并发读者持有句柄时 replace 可能短暂 PermissionError
+    （CPython 的读取端不带 FILE_SHARE_DELETE，而 Rust / JS 读端带、不受影响）
+    ——读取窗口只有微秒级，短暂重试后仍失败才抛 OSError（调用方兜底、目标
+    保持旧版），临时文件尽力清理。"""
+    tmp = f"{path}.tmp-{os.getpid()}-{threading.get_ident()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        for attempt in range(5):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.02)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _load_config():
     cfg = dict(DEFAULT_CONFIG)
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
-            loaded = json.load(f)
-        if isinstance(loaded, dict):
-            for key in CONTROL_KEYS:
-                if key in loaded:
-                    cfg[key] = loaded[key]
-    except (OSError, ValueError):
-        pass
+    loaded = None
+    for attempt in range(3):  # v1.4.16：原子替换窗口内 open 可能被短暂拒绝，重读即愈
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
+                loaded = json.load(f)
+            break
+        except FileNotFoundError:
+            break  # 配置缺失（新装机常态）：默认值即可，不重试不拖延
+        except (OSError, ValueError):
+            if attempt < 2:
+                time.sleep(0.05)
+    if isinstance(loaded, dict):
+        for key in CONTROL_KEYS:
+            if key in loaded:
+                cfg[key] = loaded[key]
     for key in ("enabled", "merge_lines", "autostart"):
         cfg[key] = bool(cfg[key])
     for key in ("path", "negative_path", "editor_path"):
@@ -710,8 +905,9 @@ def _load_config():
 def _save_config(cfg):
     data = {key: cfg.get(key, DEFAULT_CONFIG[key]) for key in CONTROL_KEYS}
     try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        # v1.4.16 原子写 + 写锁：并发保存（生成线程 / UI 线程）不再有半截或交错
+        with _config_lock:
+            _atomic_write_text(CONFIG_PATH, json.dumps(data, ensure_ascii=False, indent=2))
     except OSError:
         _log("设置写入失败（不影响本次注入）")
 
@@ -921,15 +1117,15 @@ def _is_process_running(exe_name):
         return False  # 检测失败时宁可重复启动，也不要让编辑器永远起不来
 
 
-# 编辑器 exe 自动探测：编辑器发版 exe 改名（如 feeeaghelper-v2.7.5.exe
+# 编辑器 exe 自动探测：编辑器发版 exe 改名（如 feetaghelper-v2.7.5.exe
 # → v2.8.0）会让 config 硬编码的完整路径失效，故按文件名版本号在同目录自动接管。
 # 版本号解析为元组比较（v2.7.5 → (2, 7, 5)，兼容 v 前缀与任意多段数字）。
 EDITOR_EXE_RE = re.compile(r"^feetaghelper-v(\d+(?:\.\d+)*)\.exe$", re.IGNORECASE)
 
 
 def _editor_exe_version(filename):
-    """从编辑器 exe 文件名解析版本号元组（feeeaghelper-v2.7.5.exe → (2, 7, 5)）。
-    不符合 feeeaghelper-v<数字串>.exe 命名（含无版本号、非 .exe）返回 None。"""
+    """从编辑器 exe 文件名解析版本号元组（feetaghelper-v2.7.5.exe → (2, 7, 5)）。
+    不符合 feetaghelper-v<数字串>.exe 命名（含无版本号、非 .exe）返回 None。"""
     match = EDITOR_EXE_RE.match(filename)
     if not match:
         return None
@@ -938,7 +1134,7 @@ def _editor_exe_version(filename):
 
 def _resolve_editor_path(configured):
     """解析编辑器 exe 路径：configured 存在 → 原样返回；已失效（编辑器发版
-    exe 改名）→ 在 configured 所在目录扫描 feeeaghelper-v*.exe，按版本号元组
+    exe 改名）→ 在 configured 所在目录扫描 feetaghelper-v*.exe，按版本号元组
     取最新者返回，并把解析结果写回 config（下次 UI / 自动启动直接显示新路径）；
     同目录无任何候选 → 返回原值，保持"文件不存在"的原有报错行为。"""
     path = _normalize_path(configured)
@@ -956,14 +1152,15 @@ def _resolve_editor_path(configured):
     if best_version is None:
         return path
     resolved = os.path.join(os.path.dirname(path), best_name)
-    try:  # 解析结果写回 config（读原文件 → 只改 editor_path → 原样写回）
-        with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
-            data = json.load(f)
-        if isinstance(data, dict) and data.get("editor_path") != resolved:
-            data["editor_path"] = resolved
-            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            _log(f"editor_path 已失效，自动探测到最新版本并写回：{resolved}")
+    try:  # 解析结果写回 config（读原文件 → 只改 editor_path → 原样写回；
+          # v1.4.16 起持 _config_lock + 原子落盘，与其他 config 写入并发亦无半截）
+        with _config_lock:
+            with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data.get("editor_path") != resolved:
+                data["editor_path"] = resolved
+                _atomic_write_text(CONFIG_PATH, json.dumps(data, ensure_ascii=False, indent=2))
+                _log(f"editor_path 已失效，自动探测到最新版本并写回：{resolved}")
     except (OSError, ValueError):
         pass  # 写回失败不影响本次启动
     return resolved
@@ -1114,15 +1311,15 @@ def _persist_pin_key(key, value):
         legacy = _legacy_pin_file(key)
         if legacy and os.path.isfile(legacy):
             try:
-                with open(legacy, "w", encoding="utf-8") as f:
-                    f.write(normalized + "\n" if normalized else "")
+                with _config_lock:
+                    _atomic_write_text(legacy, normalized + "\n" if normalized else "")
             except OSError as e:
                 _log(f"{os.path.basename(legacy)} 写入失败（settings.pin 已照常处理）：{e}")
     else:
         data[key] = bool(value)
     try:
-        with open(SETTINGS_PIN_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        with _config_lock:
+            _atomic_write_text(SETTINGS_PIN_PATH, json.dumps(data, ensure_ascii=False, indent=2))
     except OSError as e:
         _log(f"settings.pin 写入失败（config 已照常保存）：{e}")
 
@@ -1412,12 +1609,19 @@ def _register_bus_endpoints(app):
     def _bus_status():
         if not bus_armed():
             return Response(status_code=404)
-        try:
-            with open(STATUS_PATH, "rb") as f:
-                return Response(content=f.read(), media_type="application/json",
-                                headers={"Access-Control-Allow-Origin": "*"})
-        except OSError:
+        data = None
+        for attempt in range(3):  # v1.4.16：status 原子替换窗口内 open 可能被短暂拒绝，重读
+            try:
+                with open(STATUS_PATH, "rb") as f:
+                    data = f.read()
+                break
+            except OSError:
+                if attempt < 2:
+                    time.sleep(0.02)
+        if data is None:
             return Response(status_code=404)
+        return Response(content=data, media_type="application/json",
+                        headers={"Access-Control-Allow-Origin": "*"})
 
     def _bus_image(name: str = ""):
         if not bus_armed():
@@ -1466,7 +1670,26 @@ def _register_bus_endpoints(app):
         _log(f"总线端点注册失败（不影响其他功能）：{e}")
 
 
+def _on_before_ui():
+    """UI 重建复位（v1.4.16，盲测 P1-2 修复）：Reload UI / Restart Gradio 时
+    A1111 重建整个界面并重跑全部脚本 ui()（webui.py 主循环：before_ui_callback
+    → create_ui；Python 模块不重导入，模块级状态全部过期）。复位接线状态与
+    组件捕获——否则新 apply 钮永不接线（_WIRED=True 挡住，apply 静默死亡
+    直到重启进程），且 _SCRIPT_LISTS / _TAB_CONTROLS 持旧引用无界累加、
+    _UI_COMPONENTS 里的陈旧条目会在重建中途被误当作已捕获组件接进事件。
+    before_ui 在任何新组件创建之前触发，此处清空无竞态。"""
+    _WIRED.clear()
+    _UI_COMPONENTS.clear()
+    _SCRIPT_LISTS.clear()
+    _BUS_BUTTONS.clear()
+    _AD_FIELDS.clear()
+    _AD_BUTTONS.clear()
+    _TAB_CONTROLS.clear()
+    _SECTION_STATE.clear()
+
+
 def _on_app_started(demo=None, app=None):
+    _start_bus_watchdog()
     if app is not None:
         _register_bus_endpoints(app)
     if bus_armed():
@@ -1484,5 +1707,6 @@ def _on_app_started(demo=None, app=None):
     _log(f"自动启动编辑器：{message}")
 
 
+script_callbacks.on_before_ui(_on_before_ui)
 script_callbacks.on_after_component(_on_after_component)
 script_callbacks.on_app_started(_on_app_started)
