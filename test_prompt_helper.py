@@ -263,6 +263,43 @@ check("injected_tags 按展开前平铺 tag 流计数（BREAK 不吃掉逗号）
 os.unlink(META_TXT)
 os.unlink(META_NEG)
 
+print("== before_process 快照锁定提示词（v1.4.15 方案 A）==")
+# 用例 1：params.json 顶层带非空 prompt 键 → 正向注入用快照文本替代 prompt.txt 读取
+with open(ns["PARAMS_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"prompt": "snapshot locked tags, <lora:swapA>"}, f)
+_logs = []
+_orig_log = ns["_log"]
+ns["_log"] = _logs.append
+try:
+    p = FakeP()
+    script.before_process(p, True, REAL_TXT, "", True, False, "")
+finally:
+    ns["_log"] = _orig_log
+check("params.prompt 有值 → 注入用快照文本（txt 内容不参与）",
+      p.prompt == "snapshot locked tags, <lora:swapA>, masterpiece, best quality")
+check("快照注入日志带（快照锁定）标注",
+      any("正向已注入" in line and "快照锁定" in line for line in _logs))
+recorded = json.loads(p.extra_generation_params.get("fth_meta", "{}"))
+check("快照注入统计照写（injected_tags / full_text 走同一管线）",
+      recorded.get("injected_tags") == 2 and recorded.get("full_text") == p.prompt)
+
+# 用例 2：params.json 无 prompt 键 → 现状读 txt
+with open(ns["PARAMS_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"base": {"width": 832}}, f)
+p = FakeP()
+script.before_process(p, True, REAL_TXT, "", True, False, "")
+check("params 无 prompt 键 → 回落读 txt",
+      p.prompt == base + ", masterpiece, best quality")
+
+# 用例 3：prompt 键为空白串 → 同无键，回落读 txt
+with open(ns["PARAMS_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"prompt": "   "}, f)
+p = FakeP()
+script.before_process(p, True, REAL_TXT, "", True, False, "")
+check("params.prompt 空白 → 回落读 txt",
+      p.prompt == base + ", masterpiece, best quality")
+os.unlink(ns["PARAMS_PATH"])
+
 print("== 生成页总线：bus 读取 ==")
 check("bus json：文件缺失返回 None", ns["_read_bus_json"](ns["CMD_PATH"]) is None)
 with open(ns["CMD_PATH"], "w", encoding="utf-8") as f:

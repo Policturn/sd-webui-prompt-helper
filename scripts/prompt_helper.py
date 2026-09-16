@@ -100,6 +100,17 @@ applied_ts > cmd.ts 即参数已在服务端算完回包，小驻留后立即点
 固定盲等 700ms）；信号缺失（旧版 JS / 写失败）由 JS 超时回落旧盲等，服务端
 零额外风险。JS 侧同步：轮询 500ms→200ms、切页签提前、信号等待双节拍驱动
 （Worker 心跳 + 50ms setInterval，隐藏页不退化），见 javascript/feetag_generate.js。
+
+v1.4.15 方案 A（快照锁定提示词）：编辑器「替换并生成」的参数快照（排队快照制）
+额外携带触发时刻的完整提示词文本——params.json 顶层可选 prompt 键。before_process
+注入时 bus 武装且该键非空 → 正向 tag 文本用快照值替代 prompt.txt 实时读取
+（_read_snapshot_prompt；仍走 strip_meta_tags→expand_breaks→_inject 全管线，
+p.prompt 页面基底不动，日志带「（快照锁定）」标注）——修「替换并生成」连点 /
+排队期间后续替换、库组自动轮换改写 txt 导致先发出的快照读到被覆盖词（挑着
+生成 / 模型丢失）。无键 / 空白 / bus 未武装（params.json 陈旧残留不得锁定）/
+读失败 → 回落现状读 txt，语义不变。params.json 只被编辑器覆盖写、无删除方，
+生成轮内（写 params+cmd → apply → 点生成 → before_process）无下一轮覆盖窗口，
+轮末读盘安全；读一次小 json 的开销可接受。
 """
 
 import base64
@@ -142,7 +153,7 @@ SETTINGS_PIN_PATH = os.path.join(EXT_DIR, "settings.pin")
 NEGATIVE_PIN_PATH = os.path.join(EXT_DIR, "negative_path.pin")
 POSITIVE_PIN_PATH = os.path.join(EXT_DIR, "positive_path.pin")
 
-PLUGIN_VERSION = "1.4.14"
+PLUGIN_VERSION = "1.4.15"
 
 CONTROL_KEYS = ("enabled", "path", "negative_path", "merge_lines",
                 "autostart", "editor_path")
@@ -305,6 +316,24 @@ def _read_bus_json(path):
             if attempt == 0:
                 time.sleep(0.1)
     return None
+
+
+def _read_snapshot_prompt():
+    """读 params.json 顶层 prompt 键（v1.4.15 方案 A：快照锁定提示词）。
+
+    「替换并生成」的参数快照额外携带触发时刻的完整提示词文本（编辑器侧 formatList(positive)）。
+    返回非空 str = 本次注入的 tag 文本用它替代 prompt.txt 实时读取——排队期间后续替换/库组
+    轮换改写 txt 不再吃掉先发出的快照（修「挑着生成/模型丢失」）。
+    生命周期论证：params.json 只被编辑器覆盖写、无删除方（cmd.json 才是取走即删的那个）；
+    生成轮内时序 = 编辑器写 params+cmd → 页面 JS 点 apply（params 回填 UI）→ 点生成 →
+    before_process（此处读取）——下一轮 params 要等上一张结算后才发出，轮内无覆盖窗口。
+    无键 / 空白 / 非字符串 / 文件缺失损坏 → 返回 ""（调用方回落读 txt）。
+    """
+    params = _read_bus_json(PARAMS_PATH)
+    if not isinstance(params, dict):
+        return ""
+    value = params.get("prompt")
+    return value.strip() if isinstance(value, str) else ""
 
 
 def _consume_cmd():
@@ -1263,7 +1292,16 @@ class PromptHelperScript(scripts.Script):
         if not enabled:
             return
 
-        tags, message = read_tag_file(path, merge_lines)
+        # 方案 A（v1.4.15 快照锁定提示词）：bus 武装且 params.json 带非空 prompt 键 → 本次注入的
+        # tag 文本用快照锁定的提示词替代 prompt.txt 实时读取（txt 读取失败也无所谓——根本不读）；
+        # 仍走 strip_meta_tags→expand_breaks→_inject 全管线（p.prompt 页面基底不动，语义与 txt
+        # 注入完全一致）。无键 / 为空 → 现状读 txt。bus 未武装 = 手动面板生成，params.json 是
+        # 陈旧残留，不得锁定（bus_armed 现查，一次 stat）。
+        snap_prompt = _read_snapshot_prompt() if bus_armed() else ""
+        if snap_prompt:
+            tags, message = snap_prompt, "params.json prompt 键（快照锁定）"
+        else:
+            tags, message = read_tag_file(path, merge_lines)
         if tags is None:
             _log(f"正向跳过注入：{message}")
         else:
