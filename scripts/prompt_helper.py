@@ -142,7 +142,7 @@ SETTINGS_PIN_PATH = os.path.join(EXT_DIR, "settings.pin")
 NEGATIVE_PIN_PATH = os.path.join(EXT_DIR, "negative_path.pin")
 POSITIVE_PIN_PATH = os.path.join(EXT_DIR, "positive_path.pin")
 
-PLUGIN_VERSION = "1.4.13"
+PLUGIN_VERSION = "1.4.14"
 
 CONTROL_KEYS = ("enabled", "path", "negative_path", "merge_lines",
                 "autostart", "editor_path")
@@ -1398,11 +1398,31 @@ def _register_bus_endpoints(app):
                         media_type="application/json",
                         headers={"Access-Control-Allow-Origin": "*"})
 
+    def _bus_progress(request):
+        """（v1.4.14）生成进度转发端点：编辑器 webview 直连 /sdapi/v1/progress 被 A1111 CORS 拦
+        （与 /file= 同款问题，G-2 实锤），经本端点同源转发。进度 API 挂在 WebUI 自身端口——从请求
+        Host 头推（端口漂移安全），skip_current_image=true 免回传 base64 大图。异常回 JSON null
+        （前端回落秒数显示），不 5xx 不刷日志。"""
+        if not bus_armed():
+            return Response(status_code=404)
+        try:
+            import urllib.request
+            host = request.headers.get("host") or "127.0.0.1:7860"
+            with urllib.request.urlopen(
+                    f"http://{host}/sdapi/v1/progress?skip_current_image=true", timeout=3) as r:
+                return Response(content=r.read(), media_type="application/json",
+                                headers={"Access-Control-Allow-Origin": "*"})
+        except Exception:
+            return Response(content=json.dumps({"progress": None, "eta": None}),
+                            media_type="application/json",
+                            headers={"Access-Control-Allow-Origin": "*"})
+
     try:
         app.add_api_route("/feetag/bus/status", _bus_status, methods=["GET"], include_in_schema=False)
         app.add_api_route("/feetag/bus/image", _bus_image, methods=["GET"], include_in_schema=False)
         app.add_api_route("/feetag/bus/cmd", _bus_cmd, methods=["GET"], include_in_schema=False)
-        _log("总线端点已注册：GET /feetag/bus/status、/feetag/bus/image、/feetag/bus/cmd（bus.armed 门控）")
+        app.add_api_route("/feetag/bus/progress", _bus_progress, methods=["GET"], include_in_schema=False)
+        _log("总线端点已注册：GET /feetag/bus/status、/feetag/bus/image、/feetag/bus/cmd、/feetag/bus/progress（bus.armed 门控）")
     except Exception as e:
         _log(f"总线端点注册失败（不影响其他功能）：{e}")
 

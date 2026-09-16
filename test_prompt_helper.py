@@ -553,8 +553,36 @@ class FakeApp:
 
 fake_app = FakeApp()
 ns["_register_bus_endpoints"](fake_app)
-check("总线端点注册（status/image/cmd 三条）",
-      set(fake_app.routes) == {"/feetag/bus/status", "/feetag/bus/image", "/feetag/bus/cmd"})
+check("总线端点注册（status/image/cmd/progress 四条）",
+      set(fake_app.routes) == {"/feetag/bus/status", "/feetag/bus/image", "/feetag/bus/cmd", "/feetag/bus/progress"})
+
+# progress 端点（v1.4.14）：armed 门控 404；转发返回 JSON + CORS 头；异常回 null JSON 不 5xx
+class _FakeReq:
+    def __init__(self, host): self.headers = {"host": host}
+class _FakeUrlopen:
+    def __init__(self, payload): self._p = payload
+    def read(self): return self._p
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+import urllib.request as _urlreq
+bus_progress = fake_app.routes["/feetag/bus/progress"]
+import types
+_orig_remove = os.path.isfile
+os.path.isfile = lambda p: True   # 模拟 bus.armed 在位（沿测试既有桩法）
+try:
+    _orig_urlopen = _urlreq.urlopen
+    _urlreq.urlopen = lambda url, timeout=None: _FakeUrlopen(b'{"progress": 0.42, "eta": 8}')
+    resp = bus_progress(_FakeReq("127.0.0.1:7860"))
+    check("progress 端点：转发 JSON+CORS",
+          resp.status_code == 200 and json.loads(resp.body)["progress"] == 0.42
+          and resp.headers.get("Access-Control-Allow-Origin") == "*")
+    _urlreq.urlopen = lambda url, timeout=None: (_ for _ in ()).throw(RuntimeError("down"))
+    resp = bus_progress(_FakeReq("127.0.0.1:7860"))
+    check("progress 端点：后端异常回 null JSON",
+          resp.status_code == 200 and json.loads(resp.body)["progress"] is None)
+finally:
+    _urlreq.urlopen = _orig_urlopen
+    os.path.isfile = _orig_remove
 bus_cmd = fake_app.routes["/feetag/bus/cmd"]
 
 CMD = {"action": "generate", "page": "txt2img", "ts": 1788840420000}
