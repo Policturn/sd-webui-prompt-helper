@@ -372,6 +372,73 @@ check("apply：有 AD 文本时输出数仍恒为 8（解析失败兜底不缺�
       and outs[6:] == [{"__type__": "update"}] * 2)
 os.unlink(ns["PARAMS_PATH"])
 
+print("== 生成页总线：apply 完成信号 applied_ts（v1.4.13，取代盲等 700ms）==")
+
+
+def _now_ms():
+    return int(time.time() * 1000)
+
+
+def _wait_ms_past(ts):
+    while _now_ms() <= ts:  # 毫秒同值边界防抖：确保后续 applied_ts 严格更大
+        time.sleep(0.001)
+
+
+def _read_status_file():
+    with open(ns["STATUS_PATH"], encoding="utf-8") as f:
+        return json.load(f)
+
+
+# 初值：status 写入即带 applied_ts 字段（0 = 尚无 apply 完成；旧消费者按多余键忽略）
+ns["_gen_pass"] = 0
+ns["_status_snapshot"] = None
+ns["_applied_ts"] = 0
+ns["_status_last"] = {"state": "idle", "images": None, "error": None, "adetailer": None}
+ns["_write_status"]("idle")
+check("status 新增 applied_ts 字段（初值 0）", _read_status_file().get("applied_ts") == 0)
+
+sig_handler = ns["_make_apply_handler"]([
+    ("base", "width", FakeComp(minimum=64, maximum=2048), "slider_int")])
+with open(ns["PARAMS_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"base": {"width": 640}}, f)
+cmd_ts = _now_ms()
+_wait_ms_past(cmd_ts)
+outs = sig_handler()
+check("apply 完成即写 applied_ts（毫秒时间戳 > cmd.ts，JS 判据同式）",
+      outs == [{"__type__": "update", "value": 640}]
+      and _read_status_file()["applied_ts"] > cmd_ts)
+
+# 状态机字段保持：done + 图片清单在信号刷新时原样保留（不干扰编辑器轮询语义）
+ns["_write_status"]("done", images=["a.png"])
+before = _read_status_file()
+_wait_ms_past(before["applied_ts"])
+sig_handler()
+after = _read_status_file()
+check("applied_ts 刷新不改状态机字段（state/pass/images）",
+      after["state"] == "done" and after["images"] == ["a.png"]
+      and after["pass"] == before["pass"] and after["applied_ts"] > before["applied_ts"])
+
+# 粘滞携带：后续常规状态写入保留最近 applied_ts（信号不被状态刷新冲掉）
+ns["_write_status"]("busy")
+check("后续状态写入粘滞携带 applied_ts",
+      _read_status_file()["applied_ts"] == after["applied_ts"])
+
+# params 缺失：事件完成仍发信号（no-op apply 也是完成）
+os.unlink(ns["PARAMS_PATH"])
+ns["_write_status"]("idle")
+idle_applied = _read_status_file()["applied_ts"]
+_wait_ms_past(idle_applied)
+sig_handler()
+check("params 缺失：事件完成仍发信号", _read_status_file()["applied_ts"] > idle_applied)
+
+# 未启用态不发信号（handler 早退；此时 JS 也根本不轮询 cmd）
+os.remove(ns["ARMED_PATH"])
+armed_off_applied = _read_status_file()["applied_ts"]
+_wait_ms_past(armed_off_applied)
+sig_handler()
+check("未启用态不发信号", _read_status_file()["applied_ts"] == armed_off_applied)
+open(ns["ARMED_PATH"], "w").close()
+
 print("== 生成页总线：postprocess 回传 + ADetailer 内部 pass 防御 ==")
 os.makedirs(ns["FEETAG_OUT_DIR"], exist_ok=True)
 

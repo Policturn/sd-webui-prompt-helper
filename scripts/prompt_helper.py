@@ -89,6 +89,17 @@ enabled / path / negative_path / merge_lines / autostart / editor_path 全
 _preview / launch_editor / 自动启动全部消费点统一走 pin 有效值；_preview
 状态行带「（已由 settings.pin 固定）」标记（经旧独立 pin 固定则显示对应
 文件名）。每次现读、即刻生效，无需重启。
+
+v1.4.13 指令延迟压缩：发布指令到点生成的链路从「轮询发现(≤500ms) + apply
+盲等(700ms) + 切页驻留(150ms)」（实测隐藏页签定时器被 Chromium 节流后
+write→busy 高达 3.5~4.3s）压到平均 ~300ms 内。服务端配合点：status.json
+新增 applied_ts 字段（毫秒时间戳，粘滞保留最近值），apply handler（含
+ADetailer 段）完成时经 _mark_applied 刷新之、状态机字段（state/pass/images）
+沿用最近值不改写——浏览器 JS 点 apply 后轮询 /feetag/bus/status，见
+applied_ts > cmd.ts 即参数已在服务端算完回包，小驻留后立即点生成（取代
+固定盲等 700ms）；信号缺失（旧版 JS / 写失败）由 JS 超时回落旧盲等，服务端
+零额外风险。JS 侧同步：轮询 500ms→200ms、切页签提前、信号等待双节拍驱动
+（Worker 心跳 + 50ms setInterval，隐藏页不退化），见 javascript/feetag_generate.js。
 """
 
 import base64
@@ -131,7 +142,7 @@ SETTINGS_PIN_PATH = os.path.join(EXT_DIR, "settings.pin")
 NEGATIVE_PIN_PATH = os.path.join(EXT_DIR, "negative_path.pin")
 POSITIVE_PIN_PATH = os.path.join(EXT_DIR, "positive_path.pin")
 
-PLUGIN_VERSION = "1.4.12"
+PLUGIN_VERSION = "1.4.13"
 
 CONTROL_KEYS = ("enabled", "path", "negative_path", "merge_lines",
                 "autostart", "editor_path")
@@ -268,6 +279,11 @@ _WIRED = {}
 _status_lock = threading.Lock()
 _status_snapshot = None
 _gen_pass = 0
+# apply 完成信号（v1.4.13）：_write_status 增量簿记——applied_ts 粘滞携带，
+# _status_last 记录最近一次真实写入的状态机字段，_mark_applied 沿用它们只刷
+# applied_ts（不干扰 busy/done 状态机，编辑器轮询语义不变）
+_applied_ts = 0
+_status_last = {"state": "idle", "images": None, "error": None, "adetailer": None}
 # cmd.json 原子消费锁（v1.4.6）：fastapi 线程池并发处理 GET /feetag/bus/cmd，
 # 锁 + 改名保证"读后即删"退路也只可能有一个赢家
 _cmd_lock = threading.Lock()
@@ -347,16 +363,20 @@ def _publish_choices():
         return {}
 
 
-def _write_status(state, images=None, error=None, adetailer=None):
-    """写 status.json（state/pass/images/error/ts + choices [+ adetailer]）。
+def _write_status(state, images=None, error=None, adetailer=None, applied_ts=None):
+    """写 status.json（state/pass/images/error/ts + choices [+ adetailer] [+ applied_ts]）。
 
-    内容签名（state/pass/images/error/adetailer/choices）未变化时不重写——客户端高频轮询
-    的只是不再变化的文件，磁盘零增长；ts 仅在真实写入时刷新。
-    任何写入异常只打日志，绝不影响生成。
+    内容签名（state/pass/images/error/adetailer/choices/applied_ts）未变化时不重写
+    ——客户端高频轮询的只是不再变化的文件，磁盘零增长；ts 仅在真实写入时刷新。
+    applied_ts（v1.4.13）：apply 完成毫秒时间戳，粘滞保留最近值（后续常规状态
+    写入原样携带，JS 的信号判据 applied_ts > cmd.ts 不受状态刷新冲掉）；显式
+    传参（_mark_applied）即刷新。任何写入异常只打日志，绝不影响生成。
     """
-    global _status_snapshot
+    global _status_snapshot, _applied_ts, _status_last
+    if applied_ts:
+        _applied_ts = int(applied_ts)
     choices = _publish_choices()
-    signature = json.dumps([state, _gen_pass, list(images or []), error, adetailer, choices],
+    signature = json.dumps([state, _gen_pass, list(images or []), error, adetailer, choices, _applied_ts],
                            ensure_ascii=False, default=str)
     with _status_lock:
         if signature == _status_snapshot:
@@ -369,6 +389,7 @@ def _write_status(state, images=None, error=None, adetailer=None):
             "ts": int(time.time() * 1000),
             "plugin": PLUGIN_VERSION,
             "choices": choices,
+            "applied_ts": _applied_ts,
         }
         if adetailer is not None:
             payload["adetailer"] = adetailer
@@ -376,8 +397,26 @@ def _write_status(state, images=None, error=None, adetailer=None):
             with open(STATUS_PATH, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False)
             _status_snapshot = signature
+            _status_last = {"state": state, "images": images,
+                            "error": error, "adetailer": adetailer}
         except OSError as e:
             _log(f"status.json 写入失败：{e}")
+
+
+def _mark_applied():
+    """apply 事件完成信号（v1.4.13）：status.json 刷新 applied_ts 为当前毫秒时间戳，
+    状态机字段（state/pass/images/error/adetailer）沿用最近一次真实值——不干扰
+    busy/done 状态机与编辑器轮询语义。
+
+    浏览器 JS 点 apply 后轮询 /feetag/bus/status，见 applied_ts > cmd.ts 即本次
+    参数已在服务端算完回包，随即（小驻留后）点生成，取代旧版固定盲等 700ms；
+    JS 侧等不到信号（旧版脚本 / 字段缺失 / 写失败）时超时回落旧盲等，此处零
+    额外风险。调用点：_make_apply_handler 的 handler 末尾（armed 路径，含
+    params 空 / 损坏的 no-op 完成——事件完成本身就是信号）。
+    """
+    last = _status_last
+    _write_status(last["state"], images=last["images"], error=last["error"],
+                  adetailer=last["adetailer"], applied_ts=int(time.time() * 1000))
 
 
 def _coerce_value(kind, value, comp):
@@ -527,6 +566,9 @@ def _make_apply_handler(targets, ad_fields=None):
             # targets + ad_fields，缺段会让 gradio 抛 "didn't receive enough
             # output values" 并把前段（常规参数）的更新一并丢弃（apply 静默失效）
             updates.extend(gr.update() for _ in ad_fields)
+        # v1.4.13 apply 完成信号：handler 跑完（含 params 空/损坏的 no-op 完成）
+        # 即刷新 status.json 的 applied_ts，JS 见信号立即进生成点击（取代盲等）
+        _mark_applied()
         return updates
     return handler
 

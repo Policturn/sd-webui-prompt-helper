@@ -120,7 +120,7 @@ FeeTagHelper 构建区开启"携带元数据"时，txt 末尾会追加一个
 |---|---|---|---|
 | `params.json` | 编辑器 | 插件（apply 时读） | 要覆盖的参数，**只写要改的键**：`base`（width / height / seed / sampler_name / scheduler / steps / cfg_scale / batch_size / n_iter）+ `hires`（enable / upscaler / hr_scale / denoise / steps）+ `tiled` / `tiledvae`（分块放大，enable + 各参数）+ `usdu`（**enable=true 额外触发脚本下拉选中**，v1.4.7 契约平铺）+ `adetailer_infotext`（ADetailer 单行 infotext）；`img2img` / `extras` 段为后续版本预留 |
 | `cmd.json` | 编辑器 | 插件（服务端原子消费） | `{"action":"generate","page":"txt2img","ts":...}`，ts 递增防重放。浏览器 JS 经 `GET /feetag/bus/cmd` 轮询：服务端读取并**删除**该文件，每条命令全局恰有一个消费者取到（200），其余请求 404——多浏览器 / 多页签并存不再竞态抢指令（v1.4.6 修复） |
-| `status.json` | 插件 | 编辑器轮询 | `{"state":"idle/busy/done/error","pass":N,"images":[绝对路径],"error","ts","plugin","choices"}`；内容不变不重写；`choices` 为 WebUI 当前实际可用的采样器 / 调度 / 超分列表（编辑器下拉对齐用）。只读端点 `GET /feetag/bus/status` |
+| `status.json` | 插件 | 编辑器轮询 | `{"state":"idle/busy/done/error","pass":N,"images":[绝对路径],"error","ts","plugin","choices","applied_ts"}`；内容不变不重写；`choices` 为 WebUI 当前实际可用的采样器 / 调度 / 超分列表（编辑器下拉对齐用）；`applied_ts`（v1.4.13）为最近一次 apply 完成的毫秒时间戳（粘滞携带，浏览器 JS 的 apply 完成信号判据 `applied_ts > cmd.ts`）。只读端点 `GET /feetag/bus/status` |
 | `featag_out/` | 插件 | 编辑器 | 每次生成的成品图副本，`fth_年月日_时分秒毫秒_N.png` 命名。只读端点 `GET /feetag/bus/image?name=` |
 
 触发链路：编辑器写 params.json → 写 cmd.json → JS 轮询 `/feetag/bus/cmd` 取到
@@ -131,12 +131,28 @@ FeeTagHelper 构建区开启"携带元数据"时，txt 末尾会追加一个
 （hr_checkpoint 中途换模型暂不接）。ADetailer 等扩展的内部重绘 pass
 （`_ad_inner` 标记）在插件所有钩子入口直接跳过——不注入词条、不计数、不回传。
 
+指令延迟压缩（v1.4.13）：发布指令到点生成的延迟从「轮询发现(≤500ms) + apply
+盲等(700ms) + 切页驻留(150ms)」压到平均 ~300ms 内（实测隐藏页签里两级
+setTimeout 盲等被 Chromium 节流到 ~3s+，压缩前 write→busy 实测 3.5~4.3s）：
+
+- 轮询间隔 500ms→200ms（armed 态；未 armed 的 15s 探测不变）；
+- apply 盲等 700ms 改为**完成信号驱动**——服务端 apply handler 末尾向
+  status.json 写 `applied_ts`（毫秒时间戳，状态机字段沿用最近值），JS 点
+  apply 后以 50ms 粒度轮询 `/feetag/bus/status`，见 `applied_ts > cmd.ts`
+  即参数已在服务端算完回包，小驻留（100ms，等 gr.update 客户端落值）后
+  立即点生成；**信号超时 600ms（旧版脚本 / 字段缺失）回落旧盲等**
+  （补足 700ms 总时长，行为与 v1.4.10~v1.4.12 等价）；
+- 切页签提前到 apply 点击后立即执行（纯 DOM 操作，与 apply 事件回包无数据
+  依赖）；
+- 信号等待为双节拍驱动的状态机：50ms setInterval（前台细粒度）+ Worker
+  心跳（隐藏页不被 Chromium 定时器节流，信号检测不因页签隐藏退化）。
+
 轮询心跳（v1.4.11）：JS 的轮询节拍由 **Dedicated Worker 驱动**（Blob URL 内联
 创建，零新增文件）——Worker 定时器不受 Chromium 后台节流影响（页面定时器在
 标签页隐藏后退化为 ≥1s、隐藏超 5 分钟最长 1 分钟一次，曾导致 WebUI 非活跃窗口
-时生成指令被延后消费）；Worker 每 500ms 发心跳，页面收到心跳才执行轮询与
-apply/generate 点击（fetch 与 DOM 操作仍在主线程，消费语义不变）。Worker 不可
-用时自动回退主线程定时器；页面卸载时 terminate。
+时生成指令被延后消费）；Worker 每 200ms（v1.4.13 起，原 500ms）发心跳，页面
+收到心跳才执行轮询与 apply/generate 点击（fetch 与 DOM 操作仍在主线程，消费
+语义不变）。Worker 不可用时自动回退主线程定时器；页面卸载时 terminate。
 
 ### 总开关：bus.armed（v1.4.3+）
 
