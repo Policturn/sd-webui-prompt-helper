@@ -1366,7 +1366,7 @@ def _register_bus_endpoints(app):
     未启用时一律 404，与总线默认关语义一致。"""
     try:
         from fastapi import Request
-    from fastapi.responses import FileResponse, Response
+        from fastapi.responses import FileResponse, Response
     except Exception as e:  # fastapi 理论上必在（gradio 依赖）；防御性兜底
         _log(f"总线端点未注册（fastapi 导入失败）：{e}")
         return
