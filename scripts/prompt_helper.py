@@ -1365,7 +1365,8 @@ def _register_bus_endpoints(app):
     路由注册无条件（保证"放置 bus.armed 即生效"），内容按 bus_armed() 门控：
     未启用时一律 404，与总线默认关语义一致。"""
     try:
-        from fastapi.responses import FileResponse, Response
+        from fastapi import Request
+    from fastapi.responses import FileResponse, Response
     except Exception as e:  # fastapi 理论上必在（gradio 依赖）；防御性兜底
         _log(f"总线端点未注册（fastapi 导入失败）：{e}")
         return
@@ -1398,7 +1399,7 @@ def _register_bus_endpoints(app):
                         media_type="application/json",
                         headers={"Access-Control-Allow-Origin": "*"})
 
-    def _bus_progress(request):
+    def _bus_progress(request: Request):
         """（v1.4.14）生成进度转发端点：编辑器 webview 直连 /sdapi/v1/progress 被 A1111 CORS 拦
         （与 /file= 同款问题，G-2 实锤），经本端点同源转发。进度 API 挂在 WebUI 自身端口——从请求
         Host 头推（端口漂移安全），skip_current_image=true 免回传 base64 大图。异常回 JSON null
