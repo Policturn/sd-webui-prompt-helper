@@ -133,6 +133,73 @@ v1.4.16 盲测 P1×4 修复：
   原子落盘），config 族读写并持 _config_lock 串行：读者（编辑器面板轮询、
   下次 _load_config）不再可能读到半截 JSON，崩溃 / 并发写不再有截断窗口
   （positive path 被半截 config 静默清空的风险根除）。
+
+v1.4.17 连接引导（方案 B 插件侧配套，终稿=生成页面板）：txt2img 生成页挂
+「生成页总线 · 连接引导」小面板（_build_bus_panel，经 on_after_component 在
+锚点组件 txt2img_gallery 的 with 上下文内创建——A1111 把该回调补丁进组件
+__init__，回调内建件即挂载锚点正后方；不在设置手风琴，避免引导入口藏进
+设置），三件成组：
+① armed 总线开关（gr.Checkbox「启用生成页总线（允许编辑器触发生成）」，
+   常驻安全提示「开启 = 允许本机编辑器程序替你点击生成按钮」）：勾/取消 =
+   经 set_bus_armed 写/删插件目录 bus.armed，与手工放置**完全同一文件、
+   同一语义**，不另起第二套开关状态。armed 判定本就实时（bus_armed() 每次
+   调用 os.path.isfile，全部端点 / 生成钩子逐请求现查——编辑器远程写删
+   文件即刻生效，无需重启或刷新页面）；初始值 = 标志文件现状回显，WebUI
+   重启后保持一致。开关显示随外部写入同步：featag_generate.js 的探测改为
+   双向（armed↔disarmed 都检测，15s 节拍），检测到翻转时 syncArmedDisplay
+   程序化勾/取消面板开关（dispatch change 让 gradio 拾取，触发的服务端写
+   与文件现值幂等）。此前新用户必须在插件目录手工创建空文件 bus.armed
+   （无任何界面），开关补上引导链缺口。
+② 插件目录路径展示（_plugin_dir_display：EXT_DIR 由插件文件位置计算、与
+   settings.pin / params.json 同源勿手填；data-dir 属性 + 可见 code 文本
+   双通道，剪贴板被浏览器策略拦时照抄）。
+③ 「复制插件目录」按钮（复制由 featag_generate.js 独立委托点击处理器完成：
+   navigator.clipboard.writeText → execCommand/select 兜底 → 路径文本就在
+   按钮旁；点击后短暂显示「已复制 ✓」；document 级 elem_id 委托与挂载
+   位置无关）。
+仅 WebUI 仓（armed/总线为 WebUI 侧概念，ComfyUI 生成链未立项不加）。
+新用户引导链就此全程界面可点：装插件 → 生成页面板复制目录 → 粘进编辑器
+检测（编辑器直写 bus.armed 开闸，页面开关 ≤15s 回显）→ 面板可触发生成。
+
+v1.4.18 Wave B（用户拍板，编辑器配套）三件：
+①「使用网页端插件」开关 + bus.direct 文件契约：插件根 bus.direct 文件，
+   **存在 = 后端直发模式（编辑器生成不经页面）、不存在 = 现行页面链路
+   （默认）**；空文件即可、逐请求实时判定（bus_direct() 每次现查）、删 =
+   立即回页面模式——与 bus.armed 同一套文件化契约（编辑器 Wave A 按此
+   文件决定开窗方式）。生成页面板 armed 开关旁新增 Checkbox「使用网页端
+   插件的页面链路（其他插件照常生效）」：勾 = 删 bus.direct、取消勾 = 写
+   入（初始值 not bus_direct() 回显；JS 15s 探测同步显示，同 armed 机制）。
+② 后端直发链路（bus.direct 存在时）：cmd 消费改服务端——专用消费线程
+   （_direct_poller_loop，armed+direct 双开时 0.5s 节拍）经 _consume_cmd
+   原子自取命令并执行；/feetag/bus/cmd 端点在直发模式一律 404 且不消费
+   （页面 JS 与直发互斥，改名原子性保证不双消费；模式翻转瞬间在途命令至
+   多按旧模式执行一条，编辑器重发即愈）。执行 = 本机调 /sdapi/v1/txt2img
+   （进程内经 shared.cmd_opts.port，需 WebUI 以 --api 启动；参考 ad-retest
+   直发经验——before_process 注入钩子对 API 路径同样生效，R1 实证 payload
+   留空时注入链是提示词唯一来源）：params 平铺契约经 _direct_payload 纯
+   映射（base 直传；hires：enable→enable_hr / steps→hr_second_pass_steps /
+   denoise→denoising_strength / upscaler→hr_upscaler；tiled/usdu/
+   adetailer 等页面插件键不映射——直发语义即不经页面、页面插件不参与，
+   编辑器面板的 ADetailer 值同样不生效）；成图落 featag_out/（parameters
+   pnginfo 同页面链路）；busy/done/error/pass 计数走既有状态机；
+   shared.state 在 API 生成期同样更新（api.py L475 state.begin，进度端点
+   照常），另置 _direct_running 护栏防看门狗误杀。直发模式页面 JS 轮询
+   照常（cmd 恒 404，不执行）。
+③ 页面状态快照/恢复（页面链路模式的持久化，best-effort 档、gradio 版本
+   敏感——README 注明）：JS 采集（已接线字段表 elem_id 组件当前值 +
+   *_script_container 内未接线脚本输入的通用 DOM 扫描）→ POST
+   /feetag/bus/page-state 存 bus.page_state.json（原子写）；触发 = 输入
+   防抖 1.2s + pagehide keepalive 兜底。恢复 = 页面加载时 GET 回放（程序
+   化设值 + dispatch input/change，A1111 updateInput 同款）；恢复只在加载
+   时，生成时总线 apply 对受控字段的写入照常覆盖（受控字段编辑器赢、其余
+   恢复用户值）。默认开；插件目录放置 bus.page_state.disabled 即整体关闭。
+④ 设置手风琴布局重组（用户点名）：「启用注入」独立成行 + 分隔线（总开关
+   层级感）；正向 / 反向路径并排一行（用语统一「正向 / 反向」）；双预览 +
+   刷新钮 Group 成组；编辑器路径 + 复制插件路径 + 立即启动编辑器（原有
+   手动钮，原名「立即启动编辑器（测试）」去后缀）+ 启动时自动拉起 Group
+   成组。复制插件路径与生成页面板两处并存（同源 EXT_DIR 实时计算无漂移：
+   页面板服务新用户引导、设置区服务分组收纳），elem_id 不同
+   （feetag_copy_dir_settings）、JS 同一委托函数处理两处。
 """
 
 import base64
@@ -163,6 +230,16 @@ FEETAG_OUT_DIR = os.path.join(EXT_DIR, "featag_out")
 # 总开关（v1.4.3）：bus.armed 存在才启用总线（status/featag_out/apply 回填/JS 轮询）。
 # 默认关闭——词条注入（本插件核心功能）不受影响；排查期防止任何总线副作用。
 ARMED_PATH = os.path.join(EXT_DIR, "bus.armed")
+# 后端直发模式（v1.4.18 Wave B）：bus.direct 存在 = 编辑器生成走后端直发
+# （服务端自取 cmd 调 /sdapi/v1/txt2img 纯参数出图，不经页面、页面插件不
+# 参与）；不存在 = 现行页面链路（默认）。文件契约同 bus.armed：空文件即可、
+# 逐请求实时判定、删 = 立即回页面模式（编辑器 Wave A 按此文件决定开窗方式）。
+DIRECT_PATH = os.path.join(EXT_DIR, "bus.direct")
+# 页面状态快照/恢复（v1.4.18 Wave B）：页面链路模式的参数持久化——JS 采集/
+# 回放（best-effort，gradio 版本敏感），服务端只做存取。放置
+# bus.page_state.disabled = 关闭该功能（默认开）。
+PAGE_STATE_PATH = os.path.join(EXT_DIR, "bus.page_state.json")
+PAGE_STATE_OFF_PATH = os.path.join(EXT_DIR, "bus.page_state.disabled")
 # 统一设置固定文件（v1.4.12）：settings.pin（JSON，任意 config 键子集）。config
 # 全部六键会被旧页面内存值经 _save_config 反复回写冲掉（path / negative_path /
 # editor_path 同族问题），pin 文件不在该写回链路上、不可被冲掉——文件里出现的
@@ -175,7 +252,7 @@ SETTINGS_PIN_PATH = os.path.join(EXT_DIR, "settings.pin")
 NEGATIVE_PIN_PATH = os.path.join(EXT_DIR, "negative_path.pin")
 POSITIVE_PIN_PATH = os.path.join(EXT_DIR, "positive_path.pin")
 
-PLUGIN_VERSION = "1.4.16"
+PLUGIN_VERSION = "1.4.18"
 
 CONTROL_KEYS = ("enabled", "path", "negative_path", "merge_lines",
                 "autostart", "editor_path")
@@ -320,6 +397,14 @@ _BUS_BUTTONS = {}
 _AD_BUTTONS = {}
 _AD_FIELDS = {}
 _WIRED = {}
+# 生成页总线连接引导面板（v1.4.17 方案变更：armed 开关 + 插件目录展示 +
+# 复制按钮三件套，挂 txt2img 生成页本体而非设置手风琴）。A1111 把
+# after_component 回调补丁进组件 __init__（modules/gradio_extensons.py），
+# 回调触发时锚点组件的 with 上下文仍在栈上——在回调里创建组件 = 挂载在
+# 锚点正后方（本插件面板的标准挂法）。锚点 = txt2img 结果图库。
+_BUS_PANEL = {}            # 面板组件（armed_toggle / armed_status / plugin_dir / copy_dir_button）
+_BUS_PANEL_BUILT = False   # 防重入：面板自身组件的创建经同一补丁会再触发本回调
+_BUS_PANEL_ANCHOR = "txt2img_gallery"
 
 # status.json 写入去重（内容未变化不重写）+ 生成计数
 _status_lock = threading.Lock()
@@ -344,6 +429,79 @@ def bus_armed():
     """总线总开关：bus.armed 标志文件存在 = 启用。每次现查（一次 stat，代价可忽略），
     放置/删除文件即刻生效，无需重启 WebUI。"""
     return os.path.isfile(ARMED_PATH)
+
+
+def set_bus_armed(enabled):
+    """写 / 删 bus.armed 标志文件（v1.4.17，UI armed 开关落地）——与手工放置/
+    删除**完全同一文件、同一语义**（服务端每次现查、浏览器 JS 15s 探测，勾选/
+    取消即刻生效免重启），不另起第二套开关状态。返回 (是否成功, 消息)；
+    写入走 _atomic_write_text（替换窗口抗并发），删除容忍文件本就不在。"""
+    try:
+        if enabled:
+            _atomic_write_text(ARMED_PATH, "")  # 空文件 = 现行约定，内容从不被读
+        else:
+            try:
+                os.remove(ARMED_PATH)
+            except FileNotFoundError:
+                pass
+        return True, ("生成页总线已启用" if enabled else "生成页总线已关闭")
+    except OSError as e:
+        return False, f"bus.armed 操作失败：{e}"
+
+
+def bus_direct():
+    """直发模式开关（v1.4.18 Wave B）：bus.direct 标志文件存在 = 后端直发
+    （编辑器生成经服务端调 /sdapi/v1/txt2img，不经页面）；不存在 = 现行页面
+    链路（默认）。与 bus.armed 同款文件契约：每次现查（逐请求实时判定）、
+    空文件即可、删 = 立即回页面模式。"""
+    return os.path.isfile(DIRECT_PATH)
+
+
+def set_bus_direct(direct_enabled):
+    """写 / 删 bus.direct（v1.4.18，UI 直发开关落地）。返回 (是否成功, 消息)；
+    语义与文件契约同 set_bus_armed 一套模式。"""
+    try:
+        if direct_enabled:
+            _atomic_write_text(DIRECT_PATH, "")
+        else:
+            try:
+                os.remove(DIRECT_PATH)
+            except FileNotFoundError:
+                pass
+        return True, ("后端直发模式已启用" if direct_enabled else "页面链路模式已启用")
+    except OSError as e:
+        return False, f"bus.direct 操作失败：{e}"
+
+
+def page_state_enabled():
+    """页面状态快照/恢复功能开关（v1.4.18 Wave B）：默认开；插件目录放置
+    bus.page_state.disabled 即关（JS 采集/回放与服务端存取全停）。"""
+    return not os.path.isfile(PAGE_STATE_OFF_PATH)
+
+
+# bus.page_state.json 写锁（POST 存档与文档读取的并发串行；原子写配套）
+_page_state_lock = threading.Lock()
+
+
+def _page_state_document():
+    """GET /feetag/bus/page-state 的响应体（纯函数，离线可测）：功能开关 +
+    两页已接线字段表的 elem_id 清单（JS 采集/回放的已知字段集；可选组
+    tiled 系 elem_id 含在内——未装扩展时页面上不存在，JS 采集自然跳过）+
+    已存状态（缺失 / 损坏 → None）。"""
+    state = None
+    try:
+        with open(PAGE_STATE_PATH, "r", encoding="utf-8-sig") as f:
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            state = loaded
+    except (OSError, ValueError):
+        state = None
+    return {
+        "enabled": page_state_enabled(),
+        "fields": {("img2img" if key else "txt2img"): [row[2] for row in _FIELD_TABLES[key]]
+                   for key in (False, True)},
+        "state": state,
+    }
 
 
 def _read_bus_json(path):
@@ -507,9 +665,13 @@ def _bus_watchdog_tick():
     判定依据是任务活性而非耗时：数小时的慢生成（大图 tiled 超分）期间
     state.job 恒非空，不会被误伤；判定链路不可用（modules.shared 导入失败 /
     属性缺失，如离线 mock）返回 False——宁可不写 error，编辑器侧自有
-    120s 超时兜底，看门狗只是把兜底提前并给出明确 error 消息。"""
+    120s 超时兜底，看门狗只是把兜底提前并给出明确 error 消息。
+    v1.4.18：直发生成在途（_direct_running）直接不判——API 路径的
+    state.job 在另一线程更新（api.py L475 state.begin），护栏双保险。"""
     if not bus_armed() or _status_last.get("state") != "busy":
         return False
+    if _direct_running:
+        return False  # 直发生成在途（busy 由直发执行线程写入、done 由其收尾）
     try:
         from modules import shared
         job = getattr(shared.state, "job", None)
@@ -553,6 +715,142 @@ def _start_bus_watchdog():
         return
     _watchdog_started = True
     threading.Thread(target=_bus_watchdog_loop, name="feetag-bus-watchdog",
+                     daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# 后端直发链路（v1.4.18 Wave B，bus.direct 存在时）
+# ---------------------------------------------------------------------------
+
+_direct_running = False          # 直发生成在途（看门狗护栏，见 _bus_watchdog_tick）
+_direct_poller_started = False
+DIRECT_POLL_INTERVAL = 0.5       # 直发消费线程节拍（秒）——未直发时只做两次 stat
+_DIRECT_API_TIMEOUT = 900        # 本机 API 调用超时（大图 tiled 超分可达十分钟级）
+
+
+def _direct_payload(params):
+    """params.json（总线平铺契约）→ /sdapi/v1/txt2img payload（纯函数，离线可测）。
+
+    边界（直发模式语义，用户拍板）：只映射 base / hires 纯参数键——直发不经
+    页面，页面脚本插件本就不参与，tiled / tiledvae / usdu / adetailer_infotext
+    等**页面插件键一律不映射**（编辑器只接管到 params 键范围）。API 字段名与
+    总线语义键对照 H 盘 A1111 1.10.1 modules/api（Txt2ImgRequest 由
+    StableDiffusionProcessingTxt2Img 生成，同名直传；hires 特例：enable→
+    enable_hr、steps→hr_second_pass_steps、denoise→denoising_strength）。
+    prompt / negative_prompt 恒空串：词条注入走 before_process 钩子读
+    prompt.txt / params.prompt 快照（API 路径同样过全部脚本钩子，api-retest
+    R1 实证：payload 留空时注入链是提示词唯一来源）。"""
+    payload = {"prompt": "", "negative_prompt": ""}
+    base = params.get("base") if isinstance(params.get("base"), dict) else {}
+    for key in ("width", "height", "seed", "sampler_name", "scheduler",
+                "steps", "cfg_scale", "batch_size", "n_iter"):
+        if key in base and base[key] is not None:
+            payload[key] = base[key]
+    hires = params.get("hires") if isinstance(params.get("hires"), dict) else {}
+    if hires.get("enable") is True:
+        payload["enable_hr"] = True
+        for src, dst in (("upscaler", "hr_upscaler"), ("hr_scale", "hr_scale"),
+                         ("steps", "hr_second_pass_steps"),
+                         ("denoise", "denoising_strength")):
+            if src in hires and hires[src] is not None:
+                payload[dst] = hires[src]
+    return payload
+
+
+def _direct_generate(cmd):
+    """直发执行一条 generate 命令（v1.4.18，bus.direct 存在时由消费线程调用）：
+    读 params.json → 映射 → 本机调 /sdapi/v1/txt2img（进程内经自身端口，
+    需 WebUI 以 --api 启动，否则明确 error）→ 成图落 featag_out/（带
+    parameters pnginfo，与页面链路 postprocess 同款）→ done；异常写 error。
+    生成期间置 _direct_running（看门狗护栏）。"""
+    global _direct_running, _gen_pass
+    if cmd.get("page") not in (None, "txt2img"):
+        _log(f"直发模式暂不支持该目标页：{cmd.get('page')}")
+        _write_status("error", error=f"直发模式暂不支持 {cmd.get('page')} 命令"
+                                     "（直发只做纯参数 txt2img，img2img 需要源图）")
+        return
+    params = _read_bus_json(PARAMS_PATH)
+    params = params if isinstance(params, dict) else {}
+    payload = _direct_payload(params)
+    _direct_running = True
+    try:
+        _gen_pass += 1
+        _write_status("busy")
+        import urllib.request
+        from modules import shared
+        port = getattr(shared.cmd_opts, "port", None) or 7860
+        subpath = (getattr(shared.cmd_opts, "subpath", "") or "").strip("/")
+        url = (f"http://127.0.0.1:{port}/{subpath}/sdapi/v1/txt2img" if subpath
+               else f"http://127.0.0.1:{port}/sdapi/v1/txt2img")
+        req = urllib.request.Request(
+            url, data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=_DIRECT_API_TIMEOUT) as r:
+            resp = json.loads(r.read().decode("utf-8"))
+        os.makedirs(FEETAG_OUT_DIR, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S") + f"{int(time.time() * 1000) % 1000:03d}"
+        try:
+            info = json.loads(resp.get("info") or "{}")
+            infotext = (info.get("infotexts") or [""])[0]
+        except (ValueError, TypeError, IndexError):
+            infotext = ""
+        pnginfo = None
+        if infotext:
+            try:
+                from PIL import PngImagePlugin
+                pnginfo = PngImagePlugin.PngInfo()
+                pnginfo.add_text("parameters", infotext)
+            except Exception:
+                pnginfo = None
+        import io
+        saved = []
+        for i, b64 in enumerate(resp.get("images") or []):
+            path = os.path.join(FEETAG_OUT_DIR, f"fth_{stamp}_{i}.png")
+            try:
+                from PIL import Image
+                img = Image.open(io.BytesIO(base64.b64decode(b64)))
+                img.save(path, pnginfo=pnginfo) if pnginfo is not None else img.save(path)
+                saved.append(path)
+            except Exception as e:
+                _log(f"直发出图落盘 {i} 失败：{e}")
+        if not saved:
+            raise RuntimeError("API 未返回任何图像（检查 WebUI 是否以 --api 启动）")
+        _write_status("done", images=saved)
+        _log(f"直发生成完成：{len(saved)} 张图已落 featag_out/")
+    except Exception as e:  # noqa: BLE001 - 直发兜底，任何异常都写 error 不外抛
+        _log(f"直发生成失败：{e}")
+        try:
+            _write_status("error", error=f"直发生成失败：{e}")
+        except Exception:
+            pass
+    finally:
+        _direct_running = False
+
+
+def _direct_poller_loop():
+    """直发消费线程（v1.4.18）：armed + direct 双开时以 0.5s 节拍原子取 cmd 并
+    直发执行。与页面 JS 的互斥：直发模式下 /feetag/bus/cmd 端点一律 404 且
+    不消费（见 _bus_cmd）——命令只可能被本线程取到；页面模式下本线程不取。
+    模式翻转瞬间的在途命令至多按旧模式执行一条（_consume_cmd 原子性保证
+    不会双执行），编辑器重发即可。线程自身异常永不外抛、永不退出。"""
+    while True:
+        time.sleep(DIRECT_POLL_INTERVAL)
+        try:
+            if not (bus_armed() and bus_direct()):
+                continue
+            cmd = _consume_cmd()
+            if cmd and cmd.get("action") == "generate":
+                _direct_generate(cmd)
+        except Exception:
+            continue  # 消费线程永不倒
+
+
+def _start_direct_poller():
+    global _direct_poller_started
+    if _direct_poller_started:
+        return
+    _direct_poller_started = True
+    threading.Thread(target=_direct_poller_loop, name="feetag-direct-poller",
                      daemon=True).start()
 
 
@@ -828,14 +1126,63 @@ def _adetailer_marks(p):
         return None
 
 
+def _build_bus_panel():
+    """生成页（txt2img）总线连接引导面板（v1.4.17 方案变更终稿）：
+    armed 开关 + 插件目录展示 + 复制按钮三件套成组，挂生成页本体（锚点组件
+    之后）而非设置手风琴——新用户在生成页即可完成全部连接操作。
+
+    防重入：A1111 把 after_component 补丁进组件 __init__，面板自身组件的
+    创建会再触发 _on_after_component——_BUS_PANEL_BUILT 先置位再建件。
+    幂等：每轮 UI 只建一次（Reload UI 经 _on_before_ui 复位后随锚点重建）。"""
+    global _BUS_PANEL_BUILT
+    if _BUS_PANEL_BUILT:
+        return
+    _BUS_PANEL_BUILT = True
+    with gr.Accordion("生成页总线 · 连接引导（编辑器触发生成）", open=True):
+        armed_toggle = gr.Checkbox(
+            # 初始态 = 标志文件现状回显（bus_armed() 每次现查；编辑器远程写删
+            # 文件后，页面开关显示由 featag_generate.js 的探测链路 ≤15s 同步）
+            value=bus_armed(),
+            label="启用生成页总线（允许编辑器触发生成）",
+            elem_id="feetag_bus_armed",
+        )
+        armed_status = gr.HTML(value=_armed_hint_html())
+        direct_toggle = gr.Checkbox(
+            # 勾选 = 页面链路（bus.direct 删除，默认）；取消勾选 = 后端直发
+            # （写 bus.direct）。文件契约同 bus.armed；显示同步同 armed 机制。
+            value=not bus_direct(),
+            label="使用网页端插件的页面链路（其他插件照常生效）",
+            elem_id="feetag_bus_direct",
+        )
+        direct_status = gr.HTML(value=_direct_hint_html())
+        with gr.Row():
+            plugin_dir = gr.HTML(value=_plugin_dir_display(),
+                                 elem_id="feetag_plugin_dir")
+            copy_dir_button = gr.Button(value="复制插件目录",
+                                        elem_id="feetag_copy_dir", scale=0)
+    # 开关勾/取消 = 写/删现有标志文件（同一文件同一语义，服务端每次请求实时
+    # 判定，即刻生效免重启；gradio 事件不级联，JS 探测的程序化显示同步触发
+    # handler 时写的是同一状态，幂等无害）
+    armed_toggle.change(fn=_armed_toggle, inputs=[armed_toggle],
+                        outputs=[armed_status])
+    direct_toggle.change(fn=_direct_toggle, inputs=[direct_toggle],
+                         outputs=[direct_status])
+    _BUS_PANEL.update(armed_toggle=armed_toggle, armed_status=armed_status,
+                      direct_toggle=direct_toggle, direct_status=direct_status,
+                      plugin_dir=plugin_dir, copy_dir_button=copy_dir_button)
+
+
 def _on_after_component(component, **kwargs):
-    """捕获生成页参数组件（elem_id 在选择器表内的），供 apply 事件作 outputs。"""
+    """捕获生成页参数组件（elem_id 在选择器表内的），供 apply 事件作 outputs；
+    锚点组件（txt2img 图库）出现时在其上下文内挂载总线连接引导面板。"""
     try:
         elem_id = getattr(component, "elem_id", None)
         if elem_id in _WANTED_ELEM_IDS:
             _UI_COMPONENTS[elem_id] = component
         elif elem_id == _USDU_SCRIPT_LIST_ID:
             _SCRIPT_LISTS.append(component)  # 创建序：0=txt2img, 1=img2img
+        elif elem_id == _BUS_PANEL_ANCHOR:
+            _build_bus_panel()  # 回调发生在锚点 with 上下文内 → 面板挂锚点正后方
     finally:
         try:
             _try_wire_page(False)
@@ -1279,6 +1626,75 @@ def _launch_click(editor_path):
     return f"<span style='color:{color}'>{'✓' if ok else '✗'} {html.escape(message)}</span>"
 
 
+def _plugin_dir_display(compact=False):
+    """连接引导（v1.4.17，方案 B 插件侧配套）：插件安装目录展示 HTML。
+
+    编辑器连接设置改为「用户只填插件目录、其余自动推导」——此值即粘贴目标。
+    路径由插件文件位置计算（EXT_DIR = 本文件上两级，与 settings.pin /
+    params.json 同源），勿让用户手填。data-dir 属性（JS 复制主通道）+ 可见
+    <code> 文本（剪贴板被浏览器策略拦时照抄）双通道。
+    v1.4.18 两处并存：生成页面板（完整版带说明文案，elem_id=feetag_plugin_dir）
+    + 设置手风琴编辑器组（compact=True 紧凑版，elem_id=feetag_plugin_dir_settings，
+    服务分组收纳）——都从 EXT_DIR 静态计算，无漂移问题；JS 同一委托函数处理
+    两处的复制按钮。"""
+    safe = html.escape(EXT_DIR)
+    code = f'<code data-dir="{safe}" style="word-break:break-all">{safe}</code>'
+    if compact:
+        return code
+    return (f'<span style="color:#888;font-size:0.9em">生成页总线 · 插件目录'
+            f'（编辑器连接设置粘贴用）：</span><br>{code}')
+
+
+def _armed_hint_html():
+    """armed 开关下方的常驻提示（v1.4.17）：安全语义（开 = 允许本机编辑器程序
+    替你点生成按钮）+ 即刻生效说明；开关操作后由 _armed_toggle 的回执覆盖。"""
+    return ("<span style='color:#888;font-size:0.9em'>开启 = 允许本机 FeeTagHelper "
+            "编辑器程序替你点击生成按钮（写入参数并触发出图）；勾选/取消即刻"
+            "生效（写/删插件目录 bus.armed 文件），WebUI 重启后状态保持。</span>")
+
+
+def _armed_toggle(value):
+    """armed 开关事件（v1.4.17）：勾/取消 = 经 set_bus_armed 写/删 bus.armed
+    （与手工放置同一文件同一语义），返回状态行回执 HTML。控件初始值 =
+    bus_armed() 现状回显（面板构建时取，重启后与标志文件保持一致；编辑器
+    远程写删文件后由 JS 探测链路同步显示）。"""
+    enabled = bool(value)
+    ok, message = set_bus_armed(enabled)
+    _log(f"生成页总线开关（UI）：{message}")
+    if not ok:
+        return f"<span style='color:#e5484d'>✗ {html.escape(message)}</span>"
+    if enabled:
+        return ("<span style='color:#30a46c'>✓ 生成页总线已启用（bus.armed 已放置，"
+                "编辑器面板可触发生成）</span>")
+    return ("<span style='color:#888'>✓ 生成页总线已关闭（bus.armed 已移除，"
+            "编辑器触发生成即刻不再被响应）</span>")
+
+
+def _direct_hint_html():
+    """直发开关下方的常驻提示（v1.4.18）：模式语义 + 边界（页面插件不参与）。"""
+    return ("<span style='color:#888;font-size:0.9em'>勾选 = 编辑器生成经本页面执行"
+            "（ADetailer 等页面插件照常生效，默认）；取消勾选 = 后端直发：编辑器"
+            "生成 = 纯参数出图，不经页面、页面插件（ADetailer 等）不参与。勾选/"
+            "取消即刻生效（写/删插件目录 bus.direct 文件），WebUI 重启后状态保持。"
+            "</span>")
+
+
+def _direct_toggle(value):
+    """直发开关事件（v1.4.18）：勾选 = 页面链路（删 bus.direct），取消勾选 =
+    后端直发（写 bus.direct）——与编辑器 Wave A 读到的文件契约一致。初始值 =
+    not bus_direct() 现状回显；编辑器远程写删文件后由 JS 探测链路同步显示。"""
+    use_page = bool(value)
+    ok, message = set_bus_direct(not use_page)
+    _log(f"直发模式开关（UI）：{message}")
+    if not ok:
+        return f"<span style='color:#e5484d'>✗ {html.escape(message)}</span>"
+    if use_page:
+        return ("<span style='color:#30a46c'>✓ 页面链路模式（bus.direct 已移除，"
+                "编辑器生成经本页面执行、页面插件照常生效）</span>")
+    return ("<span style='color:#888'>✓ 后端直发模式（bus.direct 已放置：编辑器"
+            "生成 = 纯参数出图，不经页面、页面插件不参与）</span>")
+
+
 def _persist_settings(*values):
     _save_config(dict(zip(CONTROL_KEYS, values)))
 
@@ -1366,42 +1782,61 @@ class PromptHelperScript(scripts.Script):
 
         with gr.Accordion("外部提示词注入（实时读取 txt）", open=False,
                           elem_id=f"prompt-helper-{'img2img' if is_img2img else 'txt2img'}"):
-            enabled = gr.Checkbox(
-                value=cfg["enabled"],
-                label="启用注入（词条恒拼接在提示词最前）",
-            )
+            # —— v1.4.18 布局重组（用户点名）——
+            # ① 总开关独立成行 + 分隔线（层级感：启用注入开着，下方设置区才有意义）
+            with gr.Row():
+                enabled = gr.Checkbox(
+                    value=cfg["enabled"],
+                    label="启用注入（词条恒拼接在提示词最前）",
+                )
+            gr.HTML('<hr style="border:none;border-top:1px solid var(--border-color-primary);'
+                    'margin:0.4em 0 0.6em" />', elem_id="prompt-helper-divider")
 
-            path = gr.Textbox(
-                value=cfg["path"],
-                label="正向词条 txt 文件路径",
-                placeholder="例如：E:\\桌面\\AI file\\Design file\\prompt-helper\\prompt.txt",
-                lines=1,
-            )
-
-            negative_path = gr.Textbox(
-                value=cfg["negative_path"],
-                label="反向词条 txt 文件路径（留空则不注入反向）",
-                placeholder="例如：E:\\桌面\\AI file\\Design file\\prompt-helper\\negative.txt",
-                lines=1,
-            )
-
+            # ② 正向 / 反向路径并排同一行（用语统一「正向 / 反向」）
+            with gr.Row():
+                path = gr.Textbox(
+                    value=cfg["path"],
+                    label="正向词条 txt 文件路径",
+                    placeholder="例如：E:\\桌面\\AI file\\Design file\\prompt-helper\\prompt.txt",
+                    lines=1,
+                )
+                negative_path = gr.Textbox(
+                    value=cfg["negative_path"],
+                    label="反向词条 txt 文件路径（留空则不注入反向）",
+                    placeholder="例如：E:\\桌面\\AI file\\Design file\\prompt-helper\\negative.txt",
+                    lines=1,
+                )
             merge_lines = gr.Checkbox(value=cfg["merge_lines"], label="将文件内换行合并为一行")
 
-            autostart = gr.Checkbox(value=cfg["autostart"], label="启动 WebUI 时自动打开词条编辑器")
-            editor_path = gr.Textbox(
-                value=cfg["editor_path"],
-                label="词条编辑器路径 (exe)",
-                placeholder="例如：E:\\桌面\\AI file\\...\\feetaghelper.exe",
-                lines=1,
-            )
-            launch_status = gr.HTML()
-            launch_button = gr.Button(value="立即启动编辑器（测试）")
+            # ③ 预览组：双预览 + 刷新钮紧邻成组
+            with gr.Group():
+                with gr.Row():
+                    preview = gr.Textbox(label="正向文件预览（只读）", lines=3, interactive=False)
+                    negative_preview = gr.Textbox(label="反向文件预览（只读）", lines=3, interactive=False)
+                with gr.Row():
+                    status = gr.HTML()
+                    refresh = gr.Button(value="刷新预览", scale=0)
 
-            with gr.Row():
-                preview = gr.Textbox(label="正向文件预览（只读）", lines=3, interactive=False)
-                negative_preview = gr.Textbox(label="反向文件预览（只读）", lines=3, interactive=False)
-            status = gr.HTML()
-            refresh = gr.Button(value="刷新预览")
+            # ④ 编辑器组：编辑器路径 + 复制插件路径 + 立即启动编辑器（+ 启动时
+            #    自动拉起）。复制插件路径与生成页面板两处并存（同源 EXT_DIR 实时
+            #    计算无漂移；页面板那份服务新用户引导，这份服务分组收纳），
+            #    elem_id 不同、JS 同一委托函数处理。
+            with gr.Group():
+                editor_path = gr.Textbox(
+                    value=cfg["editor_path"],
+                    label="词条编辑器路径 (exe)",
+                    placeholder="例如：E:\\桌面\\AI file\\Design file\\prompt-helper\\feetaghelper.exe",
+                    lines=1,
+                )
+                gr.HTML(value=_plugin_dir_display(compact=True),
+                        elem_id="feetag_plugin_dir_settings")
+                with gr.Row():
+                    autostart = gr.Checkbox(value=cfg["autostart"],
+                                            label="启动 WebUI 时自动打开词条编辑器")
+                    settings_copy_button = gr.Button(
+                        value="复制插件路径", elem_id="feetag_copy_dir_settings", scale=0)
+                    launch_button = gr.Button(value="立即启动编辑器", scale=0)
+                launch_status = gr.HTML()
 
         refresh.click(fn=_preview, inputs=[path, negative_path, merge_lines],
                       outputs=[preview, negative_preview, status])
@@ -1634,6 +2069,11 @@ def _register_bus_endpoints(app):
     def _bus_cmd():
         if not bus_armed():
             return Response(status_code=404)
+        if bus_direct():
+            # v1.4.18 直发互斥：直发模式下命令由服务端消费线程（_direct_poller_loop）
+            # 原子自取并直发执行——端点一律 404 且**不消费**，页面 JS 与直发不可
+            # 双消费（_consume_cmd 改名原子性保证全局恰一个消费者）
+            return Response(status_code=404)
         cmd = _consume_cmd()
         if cmd is None:
             return Response(status_code=404)
@@ -1660,12 +2100,43 @@ def _register_bus_endpoints(app):
                             media_type="application/json",
                             headers={"Access-Control-Allow-Origin": "*"})
 
+    # —— 页面状态快照/恢复（v1.4.18 Wave B，best-effort 持久化）——
+    def _bus_page_state():
+        """GET：功能开关 + 两页已接线字段表 elem_id 清单（JS 采集/回放的已知
+        字段集）+ 已存状态。armed 门控（与总线其他端点一致）。"""
+        if not bus_armed():
+            return Response(status_code=404)
+        return Response(content=json.dumps(_page_state_document(), ensure_ascii=False),
+                        media_type="application/json",
+                        headers={"Access-Control-Allow-Origin": "*"})
+
+    async def _bus_page_state_save(request: Request):
+        """POST：JS 采集的页面状态回存 bus.page_state.json（原子写）。armed
+        门控；功能关闭（bus.page_state.disabled 在位）或内容非对象 → 不落盘。"""
+        if not bus_armed() or not page_state_enabled():
+            return Response(status_code=403)
+        try:
+            body = await request.json()
+        except Exception:
+            return Response(status_code=400)
+        if not isinstance(body, dict):
+            return Response(status_code=400)
+        try:
+            with _page_state_lock:
+                _atomic_write_text(PAGE_STATE_PATH, json.dumps(body, ensure_ascii=False))
+        except OSError as e:
+            _log(f"bus.page_state.json 写入失败：{e}")
+            return Response(status_code=500)
+        return Response(status_code=204, headers={"Access-Control-Allow-Origin": "*"})
+
     try:
         app.add_api_route("/feetag/bus/status", _bus_status, methods=["GET"], include_in_schema=False)
         app.add_api_route("/feetag/bus/image", _bus_image, methods=["GET"], include_in_schema=False)
         app.add_api_route("/feetag/bus/cmd", _bus_cmd, methods=["GET"], include_in_schema=False)
         app.add_api_route("/feetag/bus/progress", _bus_progress, methods=["GET"], include_in_schema=False)
-        _log("总线端点已注册：GET /feetag/bus/status、/feetag/bus/image、/feetag/bus/cmd、/feetag/bus/progress（bus.armed 门控）")
+        app.add_api_route("/feetag/bus/page-state", _bus_page_state, methods=["GET"], include_in_schema=False)
+        app.add_api_route("/feetag/bus/page-state", _bus_page_state_save, methods=["POST"], include_in_schema=False)
+        _log("总线端点已注册：GET /feetag/bus/status、/image、/cmd、/progress、/page-state + POST /page-state（bus.armed 门控）")
     except Exception as e:
         _log(f"总线端点注册失败（不影响其他功能）：{e}")
 
@@ -1686,10 +2157,14 @@ def _on_before_ui():
     _AD_BUTTONS.clear()
     _TAB_CONTROLS.clear()
     _SECTION_STATE.clear()
+    global _BUS_PANEL_BUILT
+    _BUS_PANEL.clear()
+    _BUS_PANEL_BUILT = False  # 重建时锚点组件会再次触发，面板随之重建
 
 
 def _on_app_started(demo=None, app=None):
     _start_bus_watchdog()
+    _start_direct_poller()  # v1.4.18：直发消费线程（armed+direct 双开时才消费）
     if app is not None:
         _register_bus_endpoints(app)
     if bus_armed():

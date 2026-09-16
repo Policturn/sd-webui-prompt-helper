@@ -11,3 +11,6 @@ positive_path.pin
 settings.pin
 *.tmp-*
 *.consuming-*
+bus.direct
+bus.page_state.json
+bus.page_state.disabled

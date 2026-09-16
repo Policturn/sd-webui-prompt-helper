@@ -5,6 +5,7 @@
 """
 
 import base64
+import html
 import importlib.util
 import json
 import os
@@ -21,13 +22,22 @@ REAL_TXT = r"E:\桌面\AI file\Design file\prompt-helper\prompt.txt"
 
 # ---- mock gradio / modules.scripts ----
 class _Comp:
+    _stack = []  # v1.4.18 布局断言：上下文管理器维护子组件树
+
     def __init__(self, *args, **kwargs):
         self._change_calls = []  # 记录 .change 接线（kwargs），供 _wire_controls 断言
+        self._args = args        # 记录构造位置参数（label/value 等在 kwargs）
+        self._kwargs = kwargs
+        self._children = []
+        if _Comp._stack:
+            _Comp._stack[-1]._children.append(self)
 
     def __enter__(self):
+        _Comp._stack.append(self)
         return self
 
     def __exit__(self, *args):
+        _Comp._stack.pop()
         return False
 
     def change(self, *args, **kwargs):
@@ -41,7 +51,7 @@ class _Comp:
 
 
 gradio = types.ModuleType("gradio")
-for name in ("Accordion", "Row", "Checkbox", "Radio", "Textbox", "HTML", "Button"):
+for name in ("Accordion", "Row", "Group", "Checkbox", "Radio", "Textbox", "HTML", "Button"):
     setattr(gradio, name, type(name, (_Comp,), {}))
 gradio.update = lambda **kwargs: dict(kwargs, __type__="update")
 
@@ -94,6 +104,10 @@ ns["ARMED_PATH"] = os.path.join(TMP_DIR, "bus.armed")
 ns["NEGATIVE_PIN_PATH"] = os.path.join(TMP_DIR, "negative_path.pin")
 ns["POSITIVE_PIN_PATH"] = os.path.join(TMP_DIR, "positive_path.pin")
 ns["SETTINGS_PIN_PATH"] = os.path.join(TMP_DIR, "settings.pin")
+# Wave B（v1.4.18）总线文件同理重定向：直发模式标志 / 页面状态快照
+ns["DIRECT_PATH"] = os.path.join(TMP_DIR, "bus.direct")
+ns["PAGE_STATE_PATH"] = os.path.join(TMP_DIR, "bus.page_state.json")
+ns["PAGE_STATE_OFF_PATH"] = os.path.join(TMP_DIR, "bus.page_state.disabled")
 open(ns["ARMED_PATH"], "w").close()
 ns["_status_snapshot"] = None
 
@@ -581,19 +595,23 @@ check("bus json：文件缺失返回 None", ns["_read_bus_json"](ns["CMD_PATH"])
 
 
 class FakeApp:
-    """捕获 add_api_route 注册的端点处理器，供离线直调。"""
+    """捕获 add_api_route 注册的端点处理器，供离线直调（v1.4.18 起 GET/POST
+    可同路径并存，键带 method 前缀）。"""
 
     def __init__(self):
         self.routes = {}
 
     def add_api_route(self, path, endpoint, methods=None, include_in_schema=False):
-        self.routes[path] = endpoint
+        self.routes[f"{(methods or ['GET'])[0]} {path}"] = endpoint
 
 
 fake_app = FakeApp()
 ns["_register_bus_endpoints"](fake_app)
-check("总线端点注册（status/image/cmd/progress 四条）",
-      set(fake_app.routes) == {"/feetag/bus/status", "/feetag/bus/image", "/feetag/bus/cmd", "/feetag/bus/progress"})
+check("总线端点注册（status/image/cmd/progress/page-state GET+POST 共六条）",
+      set(fake_app.routes) == {"GET /feetag/bus/status", "GET /feetag/bus/image",
+                               "GET /feetag/bus/cmd", "GET /feetag/bus/progress",
+                               "GET /feetag/bus/page-state",
+                               "POST /feetag/bus/page-state"})
 
 # progress 端点（v1.4.14）：armed 门控 404；转发返回 JSON + CORS 头；异常回 null JSON 不 5xx
 class _FakeReq:
@@ -604,7 +622,7 @@ class _FakeUrlopen:
     def __enter__(self): return self
     def __exit__(self, *a): return False
 import urllib.request as _urlreq
-bus_progress = fake_app.routes["/feetag/bus/progress"]
+bus_progress = fake_app.routes["GET /feetag/bus/progress"]
 import types
 _orig_remove = os.path.isfile
 os.path.isfile = lambda p: True   # 模拟 bus.armed 在位（沿测试既有桩法）
@@ -622,7 +640,7 @@ try:
 finally:
     _urlreq.urlopen = _orig_urlopen
     os.path.isfile = _orig_remove
-bus_cmd = fake_app.routes["/feetag/bus/cmd"]
+bus_cmd = fake_app.routes["GET /feetag/bus/cmd"]
 
 CMD = {"action": "generate", "page": "txt2img", "ts": 1788840420000}
 
@@ -886,6 +904,171 @@ ns["_persist_pin_key"]("editor_path", "")
 check("settings.pin 解除固定后 overrides 复位",
       "editor_path" not in ns["_read_pin_overrides"]())
 
+print("== 连接引导：插件目录展示（v1.4.17 方案 B 配套，仅 WebUI）==")
+disp = ns["_plugin_dir_display"]()
+check("插件目录展示：值为插件安装目录（EXT_DIR 同源计算，扩展根而非 scripts/ 层）",
+      os.path.basename(ns["EXT_DIR"]) == "sd-webui-prompt-helper"
+      and ns["EXT_DIR"] in disp)
+check("插件目录展示：data-dir 属性在位（JS 复制主通道）", 'data-dir="' in disp)
+check("插件目录展示：HTML 转义安全（escape 后整段在位，无裸标签注入）",
+      html.escape(ns["EXT_DIR"]) in disp and "<script" not in disp)
+
+print("== 连接引导：armed 总线开关（v1.4.17，bus.armed 同文件读写往返）==")
+check("开关写：set_bus_armed(True) 放置 bus.armed",
+      ns["set_bus_armed"](True)[0] and os.path.isfile(ns["ARMED_PATH"])
+      and ns["bus_armed"]() is True)
+check("开关删：set_bus_armed(False) 移除且幂等（文件不在也不抛）",
+      ns["set_bus_armed"](False)[0] and not os.path.isfile(ns["ARMED_PATH"])
+      and ns["set_bus_armed"](False)[0])
+fb = ns["_armed_toggle"](True)
+check("开关回执：启用文案 + 文件在位", "已启用" in fb and os.path.isfile(ns["ARMED_PATH"]))
+fb = ns["_armed_toggle"](False)
+check("开关回执：关闭文案 + 文件已删", "已关闭" in fb and not os.path.isfile(ns["ARMED_PATH"]))
+# 写失败路径：原子替换被拦 → 回执失败、标志文件不被误置
+os.replace = _boom_replace  # 复用原子写用例的拦截
+try:
+    fb = ns["_armed_toggle"](True)
+finally:
+    os.replace = _orig_replace
+check("开关写失败：回执失败文案、bus.armed 不被误置",
+      "✗" in fb and not os.path.isfile(ns["ARMED_PATH"]))
+check("常驻提示含安全语义（允许编辑器替你点生成按钮）",
+      "替你点击生成按钮" in ns["_armed_hint_html"]())
+
+print("== 连接引导：生成页面板锚点挂载（v1.4.17 终稿：on_after_component 在锚点上下文建件）==")
+ns["_BUS_PANEL"].clear()
+ns["_BUS_PANEL_BUILT"] = False
+cb(FakeComp(elem_id="txt2img_gallery"))  # 锚点组件出现 → 面板应挂载
+check("锚点触发：面板组件建成（armed/direct 开关+状态行+目录展示+复制按钮）",
+      set(ns["_BUS_PANEL"]) == {"armed_toggle", "armed_status", "direct_toggle",
+                                "direct_status", "plugin_dir", "copy_dir_button"})
+panel_toggle = ns["_BUS_PANEL"]["armed_toggle"]
+fns = [c.get("fn") for c in panel_toggle._change_calls]
+check("面板 armed 开关挂文件写入处理器", ns["_armed_toggle"] in fns)
+check("面板 direct 开关挂文件写入处理器",
+      ns["_direct_toggle"] in [c.get("fn") for c in ns["_BUS_PANEL"]["direct_toggle"]._change_calls])
+cb(FakeComp(elem_id="txt2img_gallery"))  # 锚点重复出现（面板自身组件等）不重复建
+check("面板构建幂等（防重入，不重复建件）",
+      ns["_BUS_PANEL"]["armed_toggle"] is panel_toggle
+      and len(panel_toggle._change_calls) == len(fns))
+# Reload UI 复位后面板随锚点重建（_on_before_ui 清 _BUS_PANEL/_BUS_PANEL_BUILT）
+_before_ui_cbs[-1]()
+check("Reload UI：面板状态复位（随锚点重建）",
+      not ns["_BUS_PANEL"] and ns["_BUS_PANEL_BUILT"] is False)
+cb(FakeComp(elem_id="txt2img_gallery"))
+check("重建后面板恢复", set(ns["_BUS_PANEL"]) == {"armed_toggle", "armed_status",
+                                                  "direct_toggle", "direct_status",
+                                                  "plugin_dir", "copy_dir_button"})
+
+print("== Wave B：bus.direct 契约 + 直发开关（v1.4.18）==")
+check("bus.direct 契约：写=直发模式（存在性实时判定）",
+      ns["set_bus_direct"](True)[0] and ns["bus_direct"]() is True
+      and os.path.isfile(ns["DIRECT_PATH"]))
+fb = ns["_direct_toggle"](False)  # 取消勾选「使用网页端插件」= 写 bus.direct
+check("直发开关：取消勾选写 bus.direct", os.path.isfile(ns["DIRECT_PATH"])
+      and "直发" in fb)
+fb = ns["_direct_toggle"](True)   # 勾选 = 页面链路 = 删文件
+check("直发开关：勾选删 bus.direct（回页面链路）",
+      not os.path.isfile(ns["DIRECT_PATH"]) and "页面链路" in fb)
+check("直发提示含边界语义（纯参数出图、页面插件不参与）",
+      "不经页面" in ns["_direct_hint_html"]() and "不参与" in ns["_direct_hint_html"]())
+
+# 消费互斥：直发模式下 cmd 端点 404 且不消费（命令留给服务端消费线程）
+ns["set_bus_armed"](True)  # 前文开关用例拆过 armed，此处确保总线在位再验互斥
+ns["set_bus_direct"](True)
+with open(ns["CMD_PATH"], "w", encoding="utf-8") as f:
+    json.dump(CMD, f)
+check("直发互斥：cmd 端点 404 且不消费（文件原样留给服务端线程）",
+      bus_cmd().status_code == 404 and os.path.isfile(ns["CMD_PATH"]))
+ns["set_bus_direct"](False)
+resp = bus_cmd()
+check("页面模式恢复：端点正常原子消费（同一命令）",
+      resp.status_code == 200 and json.loads(resp.body) == CMD
+      and not os.path.isfile(ns["CMD_PATH"]))
+
+print("== Wave B：直发 payload 映射（纯函数，页面插件键不映射）==")
+payload = ns["_direct_payload"]({
+    "base": {"width": 832, "height": 1216, "seed": -1, "steps": 24,
+             "sampler_name": "Euler a", "scheduler": "Karras", "cfg_scale": 7.5,
+             "batch_size": 1, "n_iter": 2},
+    "hires": {"enable": True, "upscaler": "R-ESRGAN 4x+ Anime6B",
+              "hr_scale": 1.5, "steps": 10, "denoise": 0.4},
+    "tiled": {"enable": True, "scale": 2}, "usdu": {"enable": True},
+    "adetailer_infotext": "Steps: 20, ADetailer: face"})
+check("直发映射：base 键直传", payload["width"] == 832 and payload["seed"] == -1
+      and payload["sampler_name"] == "Euler a" and payload["n_iter"] == 2)
+check("直发映射：hires 四键换 API 名",
+      payload["enable_hr"] is True
+      and payload["hr_upscaler"] == "R-ESRGAN 4x+ Anime6B"
+      and payload["hr_scale"] == 1.5
+      and payload["hr_second_pass_steps"] == 10
+      and payload["denoising_strength"] == 0.4)
+check("直发映射：页面插件键一律不映射（tiled/usdu/adetailer）",
+      not any(str(k).startswith(("tiled", "usdu", "adetailer")) for k in payload))
+check("直发映射：prompt 恒空串（注入留给 before_process 钩子）",
+      payload["prompt"] == "" and payload["negative_prompt"] == "")
+p2 = ns["_direct_payload"]({"base": {"width": 512}, "hires": {"enable": False, "denoise": 0.5}})
+check("直发映射：hires 关闭不带 hr 键 / 缺键与 null 不进 payload",
+      p2 == {"prompt": "", "negative_prompt": "", "width": 512})
+
+# img2img 命令：直发明确报 error（HTTP 之前返回，离线可测）
+ns["_gen_pass"] = 0
+ns["_status_snapshot"] = None
+ns["_status_last"] = {"state": "idle", "images": None, "error": None, "adetailer": None}
+ns["_write_status"]("idle")
+ns["_direct_generate"]({"action": "generate", "page": "img2img"})
+err_status = json.load(open(ns["STATUS_PATH"], encoding="utf-8"))
+check("直发：img2img 命令明确 error（需要源图，直发只做纯参数 txt2img）",
+      err_status["state"] == "error" and "img2img" in (err_status["error"] or ""))
+
+print("== Wave B：看门狗直发护栏 ==")
+ns["_write_status"]("busy")
+modules_pkg.shared = types.SimpleNamespace(state=types.SimpleNamespace(job=""))
+try:
+    check("护栏前基线：busy + 无运行任务仍判定卡死", ns["_bus_watchdog_tick"]() is True)
+    ns["_direct_running"] = True
+    check("看门狗护栏：直发生成在途不误杀（API 路径 state 独立线程更新）",
+          ns["_bus_watchdog_tick"]() is False)
+finally:
+    ns["_direct_running"] = False
+    del modules_pkg.shared
+
+print("== Wave B：页面状态快照/恢复（bus.page_state.json）==")
+doc = ns["_page_state_document"]()
+check("快照文档：默认开 + 已接线字段表 elem_id 清单（含可选组）+ 无存档时 state=None",
+      doc["enabled"] is True and doc["state"] is None
+      and doc["fields"]["txt2img"] == [r[2] for r in ns["_FIELD_TABLES"][False]]
+      and doc["fields"]["img2img"] == [r[2] for r in ns["_FIELD_TABLES"][True]])
+
+
+class _FakeJSONReq:
+    def __init__(self, body):
+        self._body = body
+
+    async def json(self):
+        return self._body
+
+
+import asyncio
+page_state_save = fake_app.routes["POST /feetag/bus/page-state"]
+resp204 = asyncio.run(page_state_save(_FakeJSONReq({"txt2img_width": {"text": "832"},
+                                                    "txt2img_cfg_scale": {"text": "7.5"}})))
+check("快照存档：POST 204 + 原子落盘后 GET 文档带回",
+      resp204.status_code == 204
+      and ns["_page_state_document"]()["state"] == {"txt2img_width": {"text": "832"},
+                                                    "txt2img_cfg_scale": {"text": "7.5"}})
+check("快照存档：非对象 body 拒绝 400",
+      asyncio.run(page_state_save(_FakeJSONReq([1, 2]))).status_code == 400)
+open(ns["PAGE_STATE_OFF_PATH"], "w").close()
+check("快照功能关：bus.page_state.disabled 在位 → enabled False + POST 403",
+      ns["_page_state_document"]()["enabled"] is False
+      and asyncio.run(page_state_save(_FakeJSONReq({"x": 1}))).status_code == 403)
+os.remove(ns["PAGE_STATE_OFF_PATH"])
+check("拆 disabled 文件即恢复（默认开）", ns["page_state_enabled"]() is True)
+if os.path.isfile(ns["PAGE_STATE_PATH"]):
+    os.unlink(ns["PAGE_STATE_PATH"])
+ns["set_bus_direct"](False)  # 收尾：回页面链路模式，不污染后续用例
+
 print("== 编辑器联动启动 ==")
 check("on_app_started 回调已注册", len(_registered_callbacks) >= 1)
 ok, msg = ns["launch_editor"]("")
@@ -1107,5 +1290,72 @@ with open(ns["CONFIG_PATH"], "w", encoding="utf-8") as f:
 cfg = ns["_load_config"]()
 check("旧版残留键（position 等）被白名单忽略", cfg["enabled"] is True and cfg["path"] == "Z"
       and "position" not in cfg and "inject_negative" not in cfg)
+
+print("== ui() 冒烟：返回值契约 + 布局重组断言（v1.4.18 ④，mock 组件树离线可测）==")
+
+
+def _walk(comp):
+    yield comp
+    for ch in getattr(comp, "_children", []):
+        yield from _walk(ch)
+
+
+def _texts(comp):
+    """组件树内全部 label / value / placeholder 文本（布局分组断言用）。"""
+    out = []
+    for c in _walk(comp):
+        kw = getattr(c, "_kwargs", {})
+        for key in ("label", "value", "placeholder"):
+            if kw.get(key):
+                out.append(str(kw[key]))
+    return out
+
+
+_ui_root = _Comp()
+with _ui_root:
+    returned = script.ui(False)
+check("ui()：返回值契约不变（6 控件，连接引导不进脚本参数）", len(returned) == 6)
+
+acc = next((c for c in _ui_root._children
+            if c._args and "外部提示词注入" in str(c._args[0])), None)
+check("布局：设置手风琴在位", acc is not None)
+kids = acc._children
+first_row = kids[0]
+check("布局①：启用注入独立成行居首（总开关层级感）",
+      type(first_row).__name__ == "Row"
+      and len(first_row._children) == 1
+      and str(first_row._children[0]._kwargs.get("label", "")).startswith("启用注入"))
+check("布局①：总开关后跟分隔线（prompt-helper-divider）",
+      any(c._kwargs.get("elem_id") == "prompt-helper-divider" for c in kids))
+path_row = next(r for r in kids
+                if type(r).__name__ == "Row"
+                and sum(1 for c in r._children if type(c).__name__ == "Textbox") == 2)
+path_labels = [str(c._kwargs.get("label", "")) for c in path_row._children]
+check("布局②：正向 / 反向路径并排同一行",
+      any(l.startswith("正向") for l in path_labels)
+      and any(l.startswith("反向") for l in path_labels))
+all_texts = _texts(acc)
+check("布局②：用语规范——全区无「负向 / 逆向」",
+      not any(("负向" in t or "逆向" in t) for t in all_texts))
+groups = [g for g in kids if type(g).__name__ == "Group"]
+preview_group = next(g for g in groups if any("正向文件预览" in t for t in _texts(g)))
+check("布局③：预览组内含双预览 + 刷新钮",
+      any("反向文件预览" in t for t in _texts(preview_group))
+      and any(t == "刷新预览" for t in _texts(preview_group)))
+editor_group = next(g for g in groups if any("复制插件路径" in t for t in _texts(g)))
+editor_texts = _texts(editor_group)
+check("布局④：编辑器组含路径框 + 复制插件路径 + 立即启动编辑器（+ 启动时自动拉起）",
+      any("词条编辑器路径" in t for t in editor_texts)
+      and any(t == "复制插件路径" for t in editor_texts)
+      and any(t == "立即启动编辑器" for t in editor_texts)
+      and any("启动 WebUI 时自动打开" in t for t in editor_texts))
+_js_src = open(os.path.join(HERE, "javascript", "feetag_generate.js"), encoding="utf-8").read()
+check("两处复制钮并存：设置区 elem_id 在位 + JS 同一委托绑定双按钮",
+      any(c._kwargs.get("elem_id") == "feetag_copy_dir_settings" for c in _walk(acc))
+      and ns["_BUS_PANEL"]["copy_dir_button"]._kwargs.get("elem_id") == "feetag_copy_dir"
+      and "#feetag_copy_dir_settings" in _js_src and "#feetag_copy_dir" in _js_src)
+check("快照冲刷钩子：window.__feetagFlushPageState 暴露且直调 postSave（同步采集+POST，防抖链不动）",
+      "window.__feetagFlushPageState" in _js_src
+      and "postSave()" in _js_src.split("window.__feetagFlushPageState", 1)[1][:300])
 
 print("\n全部测试通过 ✔")
