@@ -1338,6 +1338,82 @@ ok, msg = ns["launch_editor"](stale)
 ns["_is_process_running"] = real_process_check
 check("launch_editor 全链路使用解析后的 exe", ok and "feetaghelper-v2.7.5.exe" in msg)
 
+print("== v1.4.20：editor.hint 编辑器自荐路径（X-177 契约，四档优先级）==")
+ns["EDITOR_HINT_PATH"] = os.path.join(TMP_DIR, "editor.hint")
+hint_dir = tempfile.mkdtemp()
+hint_exe = os.path.join(hint_dir, "feetaghelper-v2.8.3.exe")
+open(hint_exe, "wb").close()
+scan_best = os.path.join(probe_dir, "feetaghelper-v2.7.5.exe")  # 扫描档期望值
+
+
+def _write_hint(content):
+    with open(ns["EDITOR_HINT_PATH"], "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+# 档②：用户未设置（config 空）→ hint 直接命中（立即启动零配置可用）
+_write_hint(hint_exe)
+check("hint：config 未设置时 hint 直接命中（空 configured → hint 路径）",
+      ns["_resolve_editor_path"]("") == hint_exe)
+_write_hint(hint_exe + "\r\n")  # 编辑器写文件惯例带尾换行
+check("hint：尾换行容忍", ns["_resolve_editor_path"]("") == hint_exe)
+
+# 档①：config 用户值有效 → hint 永不覆盖（用户值恒优先）
+check("hint：config 用户值有效档恒优先（hint 在场也不覆盖）",
+      ns["_resolve_editor_path"](scan_best) == scan_best)
+
+# 档② vs 扫描档：configured 失效 + 同目录有更新候选 + hint 有效 → hint 胜、
+# 且不写回 config（编辑器永不改插件 config，单向传值）
+with open(ns["CONFIG_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"editor_path": stale}, f)
+check("hint：与同目录扫描并存时 hint 胜（候选 v2.7.5 在场仍取 hint）",
+      ns["_resolve_editor_path"](stale) == hint_exe)
+check("hint：不写回 config（单向传值，config 保持用户原值）",
+      json.load(open(ns["CONFIG_PATH"], encoding="utf-8"))["editor_path"] == stale)
+
+# 档③：hint 无效 → 跳过该档回落既有链（扫描救援照常）
+os.remove(ns["EDITOR_HINT_PATH"])
+with open(ns["CONFIG_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"editor_path": stale}, f)
+check("hint：文件缺失时回落扫描档（v1.4.9 救援不受影响）",
+      ns["_resolve_editor_path"](stale) == scan_best)
+for _bad in ("", "   ", "\\", "C:\\__no_such_hint__.exe"):
+    _write_hint(_bad)
+    check(f"hint：无效内容跳过该档（{_bad!r} → 扫描档接管）",
+          ns["_resolve_editor_path"](stale) == scan_best)
+os.remove(ns["EDITOR_HINT_PATH"])
+
+# 启动链路：config 未配置 + hint 有效 → launch_editor 实际拉起 hint 指向的 exe
+_launch_popen = []
+_real_popen_hint = _subproc.Popen
+_real_proc_hint = ns["_is_process_running"]
+ns["_is_process_running"] = lambda exe_name: False
+_subproc.Popen = lambda argv, **kw: _launch_popen.append(list(argv)) or _FakePopenResult()
+try:
+    _write_hint(hint_exe)
+    ok, msg = ns["launch_editor"]("")
+finally:
+    _subproc.Popen = _real_popen_hint
+    ns["_is_process_running"] = _real_proc_hint
+    os.remove(ns["EDITOR_HINT_PATH"])
+check("启动链路：未配置 + hint 有效 → 拉起 hint 指向的 exe（零配置可用）",
+      ok and msg == "已启动：" + hint_exe
+      and _launch_popen and _launch_popen[0][-1] == hint_exe)
+
+# 档⓪（WebUI 特有）：settings.pin 有效 > hint——pin 在 launch_editor 先于
+# 解析链应用，位次最高；拦截进程探测避免真拉起，回执 exe 名即证明目标
+with open(ns["SETTINGS_PIN_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"editor_path": scan_best}, f)
+try:
+    _write_hint(hint_exe)
+    ns["_is_process_running"] = lambda exe_name: True
+    ok, msg = ns["launch_editor"](hint_exe)  # UI 传 hint_exe，pin 钉 scan_best
+finally:
+    os.remove(ns["SETTINGS_PIN_PATH"])
+    os.remove(ns["EDITOR_HINT_PATH"])
+check("hint：settings.pin 有效档位次最高（pin 在场 hint 不覆盖）",
+      ok and "feetaghelper-v2.7.5.exe" in msg and hint_exe not in msg)
+
 print("== settings.pin 统一固定（六键全覆盖，v1.4.12；旧独立 pin 兼容层）==")
 check("pin 缺失：overrides 为空（回退 config）", ns["_read_pin_overrides"]() == {})
 with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:

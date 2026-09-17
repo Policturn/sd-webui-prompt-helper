@@ -225,6 +225,16 @@ v1.4.19（X-174 真机验收实锤修复，用户即将把直发做成编辑器�
    防复发护栏）：cmd 中转送 shell 前，剥引号/空白后为空或仅由分隔符与
    点号组成（\、\\、/、.、.. 等）的路径一律不送 cmd / start，直接回
    「编辑器路径无效」error——shell 类调用收到空目标会触发系统级弹窗。
+
+v1.4.20（X-177，用户拍板）：编辑器自荐路径 hint 契约——插件根新文件
+editor.hint（单行文本 = 编辑器 exe 绝对路径，编辑器侧在连接「检测」时
+幂等写入；编辑器永不改插件 config，单向传值）。_resolve_editor_path 解析
+链插入 hint 档：pin 有效 > config 用户值有效 > **editor.hint 有效** >
+同目录扫描最新版（v1.4.9 救援保持）> 原有兜底——用户值恒优先（设置了
+就永不被 hint 覆盖），没设置则 hint 直接生效（立即启动 / 自动启动零配置
+可用）。hint 档**不写回 config**（与扫描档不同，保持单向传值语义）。
+读取容忍缺失 / 空 / 畸形（熔断守卫同款语义，无效 = 跳过该档）与编码
+兜底（utf-8-sig → gb18030，取首行剥引号）。ComfyUI 版同步镜像（v1.4.10）。
 """
 
 import base64
@@ -276,8 +286,15 @@ SETTINGS_PIN_PATH = os.path.join(EXT_DIR, "settings.pin")
 # _persist_pin_key 同步更新（若文件存在），防止"解除固定"被旧文件顶回。
 NEGATIVE_PIN_PATH = os.path.join(EXT_DIR, "negative_path.pin")
 POSITIVE_PIN_PATH = os.path.join(EXT_DIR, "positive_path.pin")
+# 编辑器自荐路径（v1.4.20，X-177 契约）：插件根 editor.hint，单行文本 =
+# 编辑器 exe 绝对路径（编辑器侧在连接「检测」时幂等写入；编辑器永不改
+# 插件 config，单向传值）。解析链位次：pin 有效 > config 用户值有效 >
+# editor.hint 有效 > 同目录扫描最新版（v1.4.9 救援保持）> 原有兜底——
+# 用户值恒优先，hint 只在用户未设置 / 已失效时兜住（零配置可用）。
+# 已被 .gitignore 排除。
+EDITOR_HINT_PATH = os.path.join(EXT_DIR, "editor.hint")
 
-PLUGIN_VERSION = "1.4.19"
+PLUGIN_VERSION = "1.4.20"
 
 CONTROL_KEYS = ("enabled", "path", "negative_path", "merge_lines",
                 "autostart", "editor_path")
@@ -1487,13 +1504,49 @@ def _editor_exe_version(filename):
     return tuple(int(part) for part in match.group(1).split("."))
 
 
+def _read_editor_hint():
+    """读插件根 editor.hint（v1.4.20 编辑器自荐路径契约）：单行 exe 绝对
+    路径，取首行、剥引号与空白。任何读取异常都不外抛；文件缺失 / 空 /
+    畸形（剥引号空白后为空或仅由分隔符点号组成——熔断守卫同款语义）/
+    指向不存在的文件，一律返回 ""（= 该档无效，解析链跳过继续走扫描
+    兜底）。编码兜底 utf-8-sig → gb18030。"""
+    try:
+        with open(EDITOR_HINT_PATH, "rb") as f:
+            raw = f.read(4096)
+    except OSError:
+        return ""
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        try:
+            text = raw.decode("gb18030")
+        except UnicodeDecodeError:
+            return ""
+    lines = text.splitlines()
+    line = lines[0].strip().strip("\"'").strip() if lines else ""
+    if not line or all(ch in "\\/. " for ch in line) or not os.path.isfile(line):
+        return ""
+    return line
+
+
 def _resolve_editor_path(configured):
-    """解析编辑器 exe 路径：configured 存在 → 原样返回；已失效（编辑器发版
-    exe 改名）→ 在 configured 所在目录扫描 feetaghelper-v*.exe，按版本号元组
-    取最新者返回，并把解析结果写回 config（下次 UI / 自动启动直接显示新路径）；
-    同目录无任何候选 → 返回原值，保持"文件不存在"的原有报错行为。"""
+    """解析编辑器 exe 路径（v1.4.20 起五档链）：① configured 存在 → 原样
+    返回（config 用户值有效，恒优先）；② editor.hint 有效 → 直接用
+    （编辑器自荐路径，不写回 config——编辑器永不改插件 config，单向传值）；
+    ③ configured 已失效（编辑器发版 exe 改名）→ 在 configured 所在目录扫描
+    feetaghelper-v*.exe，按版本号元组取最新者返回，并把解析结果写回 config
+    （下次 UI / 自动启动直接显示新路径）；④ 同目录无任何候选 → 返回原值，
+    保持"文件不存在"的原有报错行为。pin 档在调用方 launch_editor 先于本
+    函数应用（位次最高）。"""
     path = _normalize_path(configured)
-    if not path or os.path.isfile(path):
+    if path and os.path.isfile(path):
+        return path
+    # v1.4.20 editor.hint 档：用户未设置 / 已失效时编辑器自荐路径兜住
+    # （立即启动 / 自动启动零配置可用）；不写回 config，每次解析照走全链。
+    hint = _read_editor_hint()
+    if hint:
+        return hint
+    if not path:
         return path
     try:
         names = os.listdir(os.path.dirname(path))
