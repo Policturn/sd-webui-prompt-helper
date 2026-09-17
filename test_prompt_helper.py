@@ -1033,6 +1033,110 @@ finally:
     ns["_direct_running"] = False
     del modules_pkg.shared
 
+print("== v1.4.19：直发一轮 = 1 图 1 计数（X-174 双落盘双计根除）==")
+# 场景重放：直发线程 _direct_generate 调 API 期间，API 处理线程同步跑脚本钩子
+# （before_process 注入/计数/busy → postprocess 落盘/done，均在 HTTP 响应返回
+# 之前完成）——mock urlopen 在吐响应体前执行钩子，忠实复刻 /sdapi/v1/txt2img
+# 服务端管线。旧版（直发线程自落盘自计数）在此场景恰产出 2 图 / pass 2。
+os.makedirs(ns["FEETAG_OUT_DIR"], exist_ok=True)
+for _name in os.listdir(ns["FEETAG_OUT_DIR"]):
+    os.unlink(os.path.join(ns["FEETAG_OUT_DIR"], _name))
+ns["_gen_pass"] = 0
+ns["_status_snapshot"] = None
+ns["_status_last"] = {"state": "idle", "images": None, "error": None, "adetailer": None}
+ns["_write_status"]("idle")
+modules_pkg.shared = types.SimpleNamespace(
+    cmd_opts=types.SimpleNamespace(port=7860, subpath=""))
+with open(ns["PARAMS_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"base": {"width": 512, "steps": 5}}, f)
+_direct_api_state = {}
+
+
+def _fake_api_pipeline():
+    """模拟 API 处理线程：真实 WebUI 里这两步在响应返回前于服务端跑完。"""
+    api_p = FakeP()
+    script.before_process(api_p, True, REAL_TXT, "", True, False, "")  # 注入+计数+busy
+    _direct_api_state["p"] = api_p
+    script.postprocess(api_p, FakeProcessed([FakeImage()], info="Steps: 5, Seed: 965732128"))
+
+
+class _DirectResp:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def read(self):
+        _fake_api_pipeline()  # 服务端管线先于响应体返回
+        return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+ns["set_bus_direct"](True)
+# 真实可解码的 1x1 PNG：旧版直发线程会用 PIL 解码后自落一份盘——字节合法
+# 才能让「双落盘」断言对旧代码也有判别力（旧版在此场景 = 2 图 / pass 2）
+_TINY_PNG_B64 = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4"
+                 "z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC")
+_resp_body = json.dumps({"images": [_TINY_PNG_B64],
+                         "info": json.dumps({"infotexts": ["Steps: 5"]})}).encode("utf-8")
+_orig_urlopen_direct = _urlreq.urlopen
+_urlreq.urlopen = lambda url, timeout=None: _DirectResp(_resp_body)
+try:
+    ns["_direct_generate"]({"action": "generate", "page": "txt2img"})
+finally:
+    _urlreq.urlopen = _orig_urlopen_direct
+    del modules_pkg.shared
+_files = os.listdir(ns["FEETAG_OUT_DIR"])
+_st = _read_status_file()
+check("直发一轮：恰 1 图落 featag_out（钩子唯一落盘，直发线程不再双写）",
+      len(_files) == 1)
+check("直发一轮：pass 恰 +1（before_process 唯一计数，直发线程不再双计）",
+      ns["_gen_pass"] == 1 and _st["pass"] == 1)
+check("直发一轮：done 且 images 指向唯一落盘图", _st["state"] == "done"
+      and [os.path.basename(p) for p in _st["images"]] == _files)
+check("直发一轮：API 线程注入照常（直发 prompt 恒空，注入链是唯一来源）",
+      "1girl" in _direct_api_state["p"].prompt)
+check("直发收尾：_direct_running 复位", ns["_direct_running"] is False)
+
+# 失败路径：API 不可达（钩子不运行）→ 直发线程兜底写 error、不落图不计数
+ns["_gen_pass"] = 0
+ns["_status_snapshot"] = None
+ns["_status_last"] = {"state": "idle", "images": None, "error": None, "adetailer": None}
+ns["_write_status"]("idle")
+modules_pkg.shared = types.SimpleNamespace(
+    cmd_opts=types.SimpleNamespace(port=7860, subpath=""))
+_urlreq.urlopen = lambda url, timeout=None: (_ for _ in ()).throw(RuntimeError("api down"))
+try:
+    ns["_direct_generate"]({"action": "generate", "page": "txt2img"})
+finally:
+    _urlreq.urlopen = _orig_urlopen_direct
+    del modules_pkg.shared
+_st = _read_status_file()
+check("直发失败：error 写出（钩子未运行，直发线程兜底）",
+      _st["state"] == "error" and "api down" in (_st["error"] or ""))
+check("直发失败：不落新图不计数（before_process 未运行）",
+      ns["_gen_pass"] == 0 and len(os.listdir(ns["FEETAG_OUT_DIR"])) == 1)
+
+print("== v1.4.19：页面链路回归 = 1 图 1 计数（行为零变化防改窜）==")
+for _name in os.listdir(ns["FEETAG_OUT_DIR"]):
+    os.unlink(os.path.join(ns["FEETAG_OUT_DIR"], _name))
+ns["_gen_pass"] = 0
+ns["_status_snapshot"] = None
+ns["_status_last"] = {"state": "idle", "images": None, "error": None, "adetailer": None}
+ns["_write_status"]("idle")
+ns["set_bus_direct"](False)
+_page_p = FakeP()
+script.before_process(_page_p, True, REAL_TXT, "", True, False, "")
+script.postprocess(_page_p, FakeProcessed([FakeImage()], info="Steps: 24"))
+_files = os.listdir(ns["FEETAG_OUT_DIR"])
+_st = _read_status_file()
+check("页面链路一轮：1 图 1 计数 done（与直发共用同一份钩子，语义不变）",
+      len(_files) == 1 and ns["_gen_pass"] == 1 and _st["pass"] == 1
+      and _st["state"] == "done")
+
 print("== Wave B：页面状态快照/恢复（bus.page_state.json）==")
 doc = ns["_page_state_document"]()
 check("快照文档：默认开 + 已接线字段表 elem_id 清单（含可选组）+ 无存档时 state=None",
@@ -1089,6 +1193,115 @@ except OSError:
     pass
 ns["_on_app_started"]()  # 临时配置 autostart 默认关闭，应直接返回
 check("autostart 关闭时启动回调无动作", True)
+
+print("== v1.4.19：launch_editor 脱离进程树（树杀免疫，X-174 环境坑ⓐ）==")
+# 拦截 Popen 捕获 argv/creationflags（不真拉起）；_is_process_running 恒 False
+# 强制走启动分支。真实启动已由上方 .bat 用例覆盖。
+import subprocess as _subproc
+_launch_calls = []
+
+
+class _FakePopenResult:
+    returncode = 0
+
+
+def _capture_popen(argv, **kwargs):
+    _launch_calls.append((list(argv), kwargs))
+    return _FakePopenResult()
+
+
+_real_popen = _subproc.Popen
+_real_proc_check2 = ns["_is_process_running"]
+ns["_is_process_running"] = lambda exe_name: False
+_subproc.Popen = _capture_popen
+try:
+    with tempfile.NamedTemporaryFile(suffix=".exe", delete=False) as f:
+        f.write(b"MZ")
+        _exe = f.name
+    ok, msg = ns["launch_editor"](_exe)
+finally:
+    _subproc.Popen = _real_popen
+    ns["_is_process_running"] = _real_proc_check2
+    os.unlink(_exe)
+check("启动成功回执", ok and msg.startswith("已启动"))
+if os.name == "nt":
+    _base_flags = (_subproc.DETACHED_PROCESS
+                   | _subproc.CREATE_NEW_PROCESS_GROUP)
+    _argv, _kw = _launch_calls[0]
+    check("Windows 启动：cmd /c start 中转（编辑器挂 cmd 名下、cmd 即退，"
+          "taskkill /T 快照父子链断开）",
+          _argv[:4] == ["cmd", "/c", "start", ""] and _argv[4] == _exe
+          and _kw.get("cwd") == os.path.dirname(_exe))
+    check("Windows 启动：脱离旗标 + breakaway 附带（Job 脱出）",
+          _kw.get("creationflags")
+          == _base_flags | getattr(_subproc, "CREATE_BREAKAWAY_FROM_JOB", 0))
+
+    # Job 拒绝 breakaway（CreateProcess 报错）→ cmd 中转裸旗标重试仍成功
+    _launch_calls.clear()
+
+    def _reject_breakaway(argv, **kwargs):
+        _launch_calls.append((list(argv), kwargs))
+        if (kwargs.get("creationflags") or 0) & getattr(
+                _subproc, "CREATE_BREAKAWAY_FROM_JOB", 0):
+            raise OSError(5, "Access is denied")
+        return _FakePopenResult()
+
+    ns["_is_process_running"] = lambda exe_name: False
+    _subproc.Popen = _reject_breakaway
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".exe", delete=False) as f:
+            f.write(b"MZ")
+            _exe = f.name
+        ok, msg = ns["launch_editor"](_exe)
+    finally:
+        _subproc.Popen = _real_popen
+        ns["_is_process_running"] = _real_proc_check2
+        os.unlink(_exe)
+    check("breakaway 被拒：cmd 中转裸旗标重试成功（保住父子链断开）",
+          ok and _launch_calls[-1][0][:4] == ["cmd", "/c", "start", ""]
+          and _launch_calls[-1][1].get("creationflags") == _base_flags)
+
+    # cmd 中转彻底不可用（策略禁/镜像缺失）→ 回退直启（保底与旧版一致）
+    _launch_calls.clear()
+
+    def _block_cmd(argv, **kwargs):
+        _launch_calls.append((list(argv), kwargs))
+        if argv and argv[0] == "cmd":
+            raise OSError("cmd blocked")
+        return _FakePopenResult()
+
+    ns["_is_process_running"] = lambda exe_name: False
+    _subproc.Popen = _block_cmd
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".exe", delete=False) as f:
+            f.write(b"MZ")
+            _exe = f.name
+        ok, msg = ns["launch_editor"](_exe)
+    finally:
+        _subproc.Popen = _real_popen
+        ns["_is_process_running"] = _real_proc_check2
+        os.unlink(_exe)
+    check("cmd 中转不可用：回退直启（argv=[exe]、脱离旗标保留）",
+          ok and _launch_calls[-1][0] == [_exe]
+          and _launch_calls[-1][1].get("creationflags") == _base_flags
+          and len(_launch_calls) == 3)  # cmd+breakaway → cmd 裸旗标 → 直启
+
+# 熔断（v1.4.19 追加）：空 / 畸形路径不触发任何 shell 调用——Popen 零调用
+_launch_calls.clear()
+ns["_is_process_running"] = lambda exe_name: False
+_subproc.Popen = _capture_popen
+try:
+    _malformed = ["\\", "\\\\", "/", ".", "..", "   ", '""']
+    _results = [ns["launch_editor"](bad) for bad in _malformed]
+finally:
+    _subproc.Popen = _real_popen
+    ns["_is_process_running"] = _real_proc_check2
+check("熔断：空 / 畸形路径（\\ \\\\ / . .. 空白 纯引号）一律 error 回执、"
+      "零 shell 调用（防系统级「找不到文件」弹窗；空白/纯引号在解析层"
+      "归空走「未设置」分支，同为 error）",
+      all(not ok and ("编辑器路径无效" in msg or "未设置" in msg)
+          for ok, msg in _results)
+      and not _launch_calls)
 
 print("== editor_path 自动探测（编辑器发版改名根治）==")
 check("版本号解析（v 前缀 / 多段数字 / 无版本号）",

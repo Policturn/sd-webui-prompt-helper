@@ -60,7 +60,7 @@ params.scripts.usdu 互不匹配，Tiled / Tiled VAE / USDU 参数注入从未�
 v1.4.9 根治 editor_path 随编辑器发版 exe 改名失效的问题（config 硬编码完整
 路径，历史上 v2.4.1→v2.6.0→v2.6.1→v2.7.5 已三度断链、自动启动静默失效）：
 launch_editor 起始处经 _resolve_editor_path 解析——configured 指向的 exe
-存在则原样使用；已失效则在同目录扫描 feeeaghelper-v*.exe，按文件名版本号
+存在则原样使用；已失效则在同目录扫描 feetaghelper-v*.exe，按文件名版本号
 元组（(2, 7, 5) 式比较，兼容 v 前缀与任意多段数字）取最新者，并把解析结果
 写回 config（下次 UI / 自动启动直接显示新路径）；同目录无候选时返回原值，
 保持"文件不存在"的原有报错行为。进程防重探测（_is_process_running）与最终
@@ -200,6 +200,31 @@ v1.4.18 Wave B（用户拍板，编辑器配套）三件：
    成组。复制插件路径与生成页面板两处并存（同源 EXT_DIR 实时计算无漂移：
    页面板服务新用户引导、设置区服务分组收纳），elem_id 不同
    （feetag_copy_dir_settings）、JS 同一委托函数处理两处。
+
+v1.4.19（X-174 真机验收实锤修复，用户即将把直发做成编辑器侧一键按钮）：
+① **直发路径同图双落盘 + pass 双计根除**——X-174 实证一次直发生成 =
+   featag_out 两张 md5 逐字节相同图（同 seed）+ pass +2、日志恰一次注入
+   一条回传。根因：API 生成与页面生成同走全部脚本钩子——before_process
+   （API 处理线程）注入 + pass+1 + busy，postprocess 落 featag_out/ + done；
+   v1.4.18 的 _direct_generate 自己又落一份盘、计一次 pass = 双双重复。
+   收口侧选直发线程（_direct_generate 不落盘、不计数、不写 done，只留
+   开场 busy 与异常 error），全部留给钩子——与页面链路共用同一份钩子代码、
+   页面行为零变化；不在钩子侧识别直发轮次跳过，因 _direct_running 布尔
+   区分不了"直发在途时用户手动页面生成"，按它跳过会误伤页面轮次。
+   正常轮次顺序：直发线程 busy → before_process 注入/计数/busy →
+   postprocess 落盘/done（钩子在 HTTP 响应返回前同步跑完）→ 直发线程收尾。
+② **launch_editor 脱离进程树**（X-174 环境坑ⓐ：webui.py stop 的
+   taskkill /F /T 按快照父子链递归杀，编辑器作为 WebUI 直接子进程被连带
+   杀——DETACHED_PROCESS / CREATE_NEW_PROCESS_GROUP 只隔离控制台信号，
+   挡不住显式树杀）：Windows 分支改经 cmd /c start 中转（编辑器挂 cmd
+   名下、cmd 随即退出，快照父子链断开，taskkill /T 不再沿链命中）并附
+   CREATE_BREAKAWAY_FROM_JOB（宿主被放进 kill-on-close 的 Job 对象时脱出；
+   Job 禁止 breakaway 则 CreateProcess 报错，自动回退旧直启方式，保底
+   行为不劣化）。ComfyUI 版同步镜像（共享函数铁律）。
+③ **launch_editor 畸形路径熔断**（用户桌面弹「找不到 '\\' 文件」后追加的
+   防复发护栏）：cmd 中转送 shell 前，剥引号/空白后为空或仅由分隔符与
+   点号组成（\、\\、/、.、.. 等）的路径一律不送 cmd / start，直接回
+   「编辑器路径无效」error——shell 类调用收到空目标会触发系统级弹窗。
 """
 
 import base64
@@ -252,7 +277,7 @@ SETTINGS_PIN_PATH = os.path.join(EXT_DIR, "settings.pin")
 NEGATIVE_PIN_PATH = os.path.join(EXT_DIR, "negative_path.pin")
 POSITIVE_PIN_PATH = os.path.join(EXT_DIR, "positive_path.pin")
 
-PLUGIN_VERSION = "1.4.18"
+PLUGIN_VERSION = "1.4.19"
 
 CONTROL_KEYS = ("enabled", "path", "negative_path", "merge_lines",
                 "autostart", "editor_path")
@@ -760,10 +785,19 @@ def _direct_payload(params):
 def _direct_generate(cmd):
     """直发执行一条 generate 命令（v1.4.18，bus.direct 存在时由消费线程调用）：
     读 params.json → 映射 → 本机调 /sdapi/v1/txt2img（进程内经自身端口，
-    需 WebUI 以 --api 启动，否则明确 error）→ 成图落 featag_out/（带
-    parameters pnginfo，与页面链路 postprocess 同款）→ done；异常写 error。
-    生成期间置 _direct_running（看门狗护栏）。"""
-    global _direct_running, _gen_pass
+    需 WebUI 以 --api 启动，否则明确 error）；异常写 error。
+    生成期间置 _direct_running（看门狗护栏）。
+
+    v1.4.19 收口（X-174 真机实锤：直发一轮 = featag_out 两张 md5 相同图 +
+    pass +2）：API 生成与页面生成同走全部脚本钩子——before_process（API
+    处理线程内）注入 + pass+1 + busy，postprocess 落 featag_out/ + done。
+    本函数**不落盘、不计数、不写 done**（v1.4.18 自落一份自计一次即双双
+    重复的根因），只保留开场 busy（cmd 消费即反馈）与异常路径 error（API
+    层失败时钩子不会运行，状态机不能悬停在上一轮 done）。收口选直发侧而非
+    钩子侧：_direct_running 布尔区分不了"直发在途时用户手动页面生成"，
+    钩子按它跳过会误伤页面轮次；直发侧不写则与页面链路共用同一份钩子代码，
+    页面行为零变化。"""
+    global _direct_running
     if cmd.get("page") not in (None, "txt2img"):
         _log(f"直发模式暂不支持该目标页：{cmd.get('page')}")
         _write_status("error", error=f"直发模式暂不支持 {cmd.get('page')} 命令"
@@ -774,7 +808,6 @@ def _direct_generate(cmd):
     payload = _direct_payload(params)
     _direct_running = True
     try:
-        _gen_pass += 1
         _write_status("busy")
         import urllib.request
         from modules import shared
@@ -787,36 +820,11 @@ def _direct_generate(cmd):
             headers={"Content-Type": "application/json"}, method="POST")
         with urllib.request.urlopen(req, timeout=_DIRECT_API_TIMEOUT) as r:
             resp = json.loads(r.read().decode("utf-8"))
-        os.makedirs(FEETAG_OUT_DIR, exist_ok=True)
-        stamp = time.strftime("%Y%m%d_%H%M%S") + f"{int(time.time() * 1000) % 1000:03d}"
-        try:
-            info = json.loads(resp.get("info") or "{}")
-            infotext = (info.get("infotexts") or [""])[0]
-        except (ValueError, TypeError, IndexError):
-            infotext = ""
-        pnginfo = None
-        if infotext:
-            try:
-                from PIL import PngImagePlugin
-                pnginfo = PngImagePlugin.PngInfo()
-                pnginfo.add_text("parameters", infotext)
-            except Exception:
-                pnginfo = None
-        import io
-        saved = []
-        for i, b64 in enumerate(resp.get("images") or []):
-            path = os.path.join(FEETAG_OUT_DIR, f"fth_{stamp}_{i}.png")
-            try:
-                from PIL import Image
-                img = Image.open(io.BytesIO(base64.b64decode(b64)))
-                img.save(path, pnginfo=pnginfo) if pnginfo is not None else img.save(path)
-                saved.append(path)
-            except Exception as e:
-                _log(f"直发出图落盘 {i} 失败：{e}")
-        if not saved:
-            raise RuntimeError("API 未返回任何图像（检查 WebUI 是否以 --api 启动）")
-        _write_status("done", images=saved)
-        _log(f"直发生成完成：{len(saved)} 张图已落 featag_out/")
+        # 响应返回时 API 处理线程的 postprocess 已落盘 featag_out/ 并写 done、
+        # before_process 已注入并计数（钩子在 HTTP 响应之前同步跑完）。
+        if not (resp.get("images") or []):
+            raise RuntimeError("API 未返回任何图像")
+        _log("直发生成完成（成图由 postprocess 钩子回传 featag_out/）")
     except Exception as e:  # noqa: BLE001 - 直发兜底，任何异常都写 error 不外抛
         _log(f"直发生成失败：{e}")
         try:
@@ -1527,6 +1535,13 @@ def launch_editor(editor_path):
     editor_path = _resolve_editor_path(editor_path)
     if not editor_path:
         return False, "未设置编辑器路径"
+    # v1.4.19 熔断（用户桌面弹「找不到 '\\' 文件」后追加）：空 / 畸形路径
+    # （剥引号与空白后为空，或仅由分隔符 / 点号组成，如 \、\\、/、.、..）
+    # 一律不送 cmd / start——shell 类调用收到空目标会触发系统级「找不到
+    # 文件」弹窗。放在 isfile 判定之前：畸形路径零 shell 交互、零歧义回执。
+    stripped = editor_path.strip().strip("\"'").strip()
+    if not stripped or all(ch in "\\/. " for ch in stripped):
+        return False, "编辑器路径无效：" + editor_path
     if not os.path.isfile(editor_path):
         return False, "文件不存在：" + editor_path
 
@@ -1536,6 +1551,25 @@ def launch_editor(editor_path):
 
     flags = (subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
              if os.name == "nt" else 0)
+    # v1.4.19（X-174 环境坑ⓐ）：DETACHED_PROCESS / CREATE_NEW_PROCESS_GROUP 只
+    # 隔离控制台信号，挡不住显式树杀（外部 stop 按快照父子链递归强杀，如
+    # webui.py stop 的 taskkill /F /T——编辑器作为宿主直接子进程被连带杀）。
+    # Windows 下两道补强：① 经 cmd /c start 中转——编辑器挂到 cmd 名下、cmd
+    # 随即退出，快照父子链断开，树杀不再沿链命中（启动后约 0.1s 起免疫）；
+    # ② 附 CREATE_BREAKAWAY_FROM_JOB——宿主被启动器放进 kill-on-close 的
+    # Job 对象时子进程脱出 Job（Job 拒绝 breakaway 则 CreateProcess 报错，
+    # 裸旗标重试一次）；cmd 中转彻底不可用再回退直启，保底与旧版一致。
+    if os.name == "nt":
+        breakaway = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+        for extra in (breakaway, 0):  # 先带 breakaway；Job 拒绝则裸旗标重试
+            try:
+                subprocess.Popen(
+                    ["cmd", "/c", "start", "", editor_path],
+                    cwd=os.path.dirname(editor_path),
+                    creationflags=flags | extra, close_fds=True)
+                return True, "已启动：" + editor_path
+            except OSError:
+                continue
     try:
         subprocess.Popen([editor_path], cwd=os.path.dirname(editor_path),
                          creationflags=flags, close_fds=True)

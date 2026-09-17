@@ -220,6 +220,11 @@ bus.armed（编辑器按该文件决定开窗方式）：
   直发需 WebUI 以 `--api` 启动，否则该次生成回 error 状态并提示。出图同样
   落 `featag_out/`（带完整 parameters 信息）；busy/done/error 状态机、
   pass 计数、进度端点照常（直发在途有看门狗护栏，不会误报卡死）。
+  **落盘 / 计数由生成钩子统一完成（v1.4.19 收口）**：API 生成与页面生成
+  同走 before_process / postprocess 钩子——注入、pass 计数、featag_out
+  落盘、done 全部由钩子做且只做一次，直发线程只负责触发与异常兜底
+  （v1.4.18 曾由直发线程自落一份盘、自计一次 pass，与钩子合计同图双落盘
+  + pass 双计，v1.4.19 根治）。
 
 ### 页面状态快照/恢复（v1.4.18+，best-effort）
 
@@ -250,6 +255,10 @@ WebUI 且开关开启时重新生成）。
 - **想暂时停用**：取消勾选"启用注入"，或直接在编辑器里清空输出文件。
 - **编辑器联动启动**：编辑器以独立进程运行——关闭 WebUI 不会连带关闭它；
   检测到同名进程已在运行时不会重复拉起（和 ComfyUI 版同时开启也只启动一份）。
+  **进程树脱离（v1.4.19）**：Windows 下经 `cmd /c start` 中转启动（编辑器
+  挂到 cmd 名下、cmd 随即退出，进程父子链断开）并附 `CREATE_BREAKAWAY_FROM_JOB`
+  ——外部按进程树强杀 WebUI（如 `taskkill /F /T`，webui.py stop 即此）不会
+  再连带杀掉编辑器；中转不可用时自动回退直启，保底与旧版一致。
 - **editor_path 失效自动探测（v1.4.9）**：编辑器发版 exe 改名（如
   `feetaghelper-v2.7.5.exe` → `v2.8.0`）后，旧配置路径失效时启动编辑器会自动
   在同目录扫描 `feetaghelper-v*.exe`、取版本号最新的一个并写回 config——
