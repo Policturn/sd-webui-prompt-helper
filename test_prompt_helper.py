@@ -108,6 +108,8 @@ ns["SETTINGS_PIN_PATH"] = os.path.join(TMP_DIR, "settings.pin")
 ns["DIRECT_PATH"] = os.path.join(TMP_DIR, "bus.direct")
 ns["PAGE_STATE_PATH"] = os.path.join(TMP_DIR, "bus.page_state.json")
 ns["PAGE_STATE_OFF_PATH"] = os.path.join(TMP_DIR, "bus.page_state.disabled")
+# v1.4.21 破坏性变更审计日志同理重定向（护栏用例会触发真实写审计行）
+ns["AUDIT_LOG_PATH"] = os.path.join(TMP_DIR, "config.audit.log")
 open(ns["ARMED_PATH"], "w").close()
 ns["_status_snapshot"] = None
 
@@ -1646,5 +1648,117 @@ check("两处复制钮并存：设置区 elem_id 在位 + JS 同一委托绑定�
 check("快照冲刷钩子：window.__feetagFlushPageState 暴露且直调 postSave（同步采集+POST，防抖链不动）",
       "window.__feetagFlushPageState" in _js_src
       and "postSave()" in _js_src.split("window.__feetagFlushPageState", 1)[1][:300])
+
+# ---- v1.4.21 破坏性变更护栏（2026-09-17 15:20 生产事故防复发）----
+print("== v1.4.21 破坏性变更护栏 ==")
+AUDIT = os.path.join(TMP_DIR, "config.audit.log")
+
+
+def _audit_events():
+    if not os.path.isfile(AUDIT):
+        return []
+    out = []
+    with open(AUDIT, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                out.append(json.loads(line))
+    return out
+
+
+def _write_disk_config(**overrides):
+    cfg = dict(ns["DEFAULT_CONFIG"])
+    cfg.update(overrides)
+    with open(ns["CONFIG_PATH"], "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False)
+
+
+OLD_POS, OLD_NEG, OLD_EDT = r"E:\old\prompt.txt", r"E:\old\neg.txt", r"E:\old\edit.exe"
+_write_disk_config(path=OLD_POS, negative_path=OLD_NEG, editor_path=OLD_EDT)
+audit_before = len(_audit_events())
+ns["_save_config"]({"enabled": True, "path": None, "negative_path": r"E:\new\neg.txt",
+                    "merge_lines": False, "autostart": True, "editor_path": OLD_EDT})
+disk = ns["_load_config"]()
+check("护栏①：磁盘 path 非空 → 新值 None 被拒（保留旧值）", disk["path"] == OLD_POS)
+check("护栏①：未被破坏的键照常写入（negative_path 换新 / merge_lines 翻转）",
+      disk["negative_path"] == r"E:\new\neg.txt" and disk["merge_lines"] is False)
+check("护栏①：guard.block 审计行在位（事件 / 键 / 旧新值齐）",
+      any(e["event"] == "guard.block" and e["key"] == "path" and e["old"] == OLD_POS
+          and e["new"] is None and e["source"] == "_save_config" for e in _audit_events()))
+
+ns["_save_config"]({"enabled": True, "path": "", "negative_path": r"E:\new\neg.txt",
+                    "merge_lines": False, "autostart": True, "editor_path": ""})
+disk = ns["_load_config"]()
+check("护栏②：path / editor_path 磁盘非空 → 空串同样被拒",
+      disk["path"] == OLD_POS and disk["editor_path"] == OLD_EDT)
+check("护栏②：两个键各留一条 guard.block",
+      sum(1 for e in _audit_events() if e["event"] == "guard.block") >= 3)
+
+_write_disk_config(path=OLD_POS, negative_path=OLD_NEG, editor_path=OLD_EDT)
+ns["_save_config"]({"enabled": True, "path": OLD_POS, "negative_path": "",
+                    "merge_lines": True, "autostart": False, "editor_path": OLD_EDT})
+check("护栏③：negative_path 非空 → 空被拒（反向注入路径不丢）",
+      ns["_load_config"]()["negative_path"] == OLD_NEG)
+
+audit_before = len(_audit_events())
+_write_disk_config(path="", negative_path="", editor_path="")
+ns["_save_config"]({"enabled": False, "path": "", "negative_path": "", "merge_lines": True,
+                    "autostart": False, "editor_path": ""})
+disk = ns["_load_config"]()
+check("护栏④：新装机（磁盘路径全空）零误拦——空值照常落盘",
+      disk["path"] == "" and disk["negative_path"] == "" and disk["editor_path"] == "")
+check("护栏④：enabled True→False 放行不拦（关总闸是合法操作）", disk["enabled"] is False)
+check("护栏④：guard.flip 审计行在位（放行也留痕）",
+      any(e["event"] == "guard.flip" and e["key"] == "enabled" for e in _audit_events()))
+
+audit_before = len(_audit_events())
+ns["_save_config"]({"enabled": True, "path": r"E:\new\prompt.txt", "negative_path": "",
+                    "merge_lines": True, "autostart": True, "editor_path": r"E:\new\edit.exe"})
+disk = ns["_load_config"]()
+check("护栏⑤：正常保存零变化——非空换非空 / 空换非空 / enabled 开闸全放行",
+      disk["path"] == r"E:\new\prompt.txt" and disk["editor_path"] == r"E:\new\edit.exe"
+      and disk["enabled"] is True and disk["autostart"] is True)
+check("护栏⑤：正常保存不产生审计行", len(_audit_events()) == audit_before)
+
+with open(ns["SETTINGS_PIN_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"enabled": True, "path": r"E:\pin\pos.txt"}, f, ensure_ascii=False)
+ns["_persist_pin_key"]("enabled", False)
+ns["_persist_pin_key"]("path", "")
+pin_data = json.load(open(ns["SETTINGS_PIN_PATH"], encoding="utf-8"))
+check("pin 链：enabled True→False 恒写（解除语义不变）+ pin.flip 留痕",
+      pin_data.get("enabled") is False
+      and any(e["event"] == "pin.flip" and e["key"] == "enabled" for e in _audit_events()))
+check("pin 链：路径清空 = 解除固定（键删除，放行）+ pin.clear 留痕",
+      "path" not in pin_data
+      and any(e["event"] == "pin.clear" and e["key"] == "path" for e in _audit_events()))
+
+audit_before = len(_audit_events())
+ns["_persist_pin_key"]("enabled", True)
+ns["_persist_pin_key"]("path", r"E:\pin\new.txt")
+check("pin 链：正常固化（False→True / 换新路径）零审计",
+      len(_audit_events()) == audit_before)
+
+real_audit = ns["AUDIT_LOG_PATH"]
+ns["AUDIT_LOG_PATH"] = os.path.join(TMP_DIR, "no-such-dir", "config.audit.log")
+_write_disk_config(path=OLD_POS)
+ns["_save_config"]({"enabled": True, "path": "", "negative_path": "", "merge_lines": True,
+                    "autostart": False, "editor_path": ""})
+check("审计失败静默：audit 不可写时护栏照常拦截、不抛错",
+      ns["_load_config"]()["path"] == OLD_POS)
+ns["AUDIT_LOG_PATH"] = real_audit
+
+ns["_config_corrupt_logged"] = False
+with open(ns["CONFIG_PATH"], "w", encoding="utf-8") as f:
+    f.write("{half json")
+ns["_load_config"](); ns["_load_config"]()
+corrupt_rows = [e for e in _audit_events() if e["event"] == "load.corrupt"]
+check("config 损坏留痕：读失败落默认值时记 load.corrupt，且进程内只记一次",
+      len(corrupt_rows) == 1 and ns["_load_config"]()["enabled"] is True)
+_write_disk_config(path=OLD_POS)  # 恢复现场供后续用例
+
+check("v1.4.21 JS：通用扫描采集 + 回放双双跳过插件控件（isPluginControl 守卫）",
+      _js_src.count("if (isPluginControl(el)) continue;") == 2)
+check("v1.4.21 JS：closest 钉死 prompt-helper-* 容器前缀",
+      'el.closest(\'[id^="prompt-helper-"]\')' in _js_src)
 
 print("\n全部测试通过 ✔")

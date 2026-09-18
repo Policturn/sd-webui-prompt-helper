@@ -405,6 +405,17 @@
     var fields = null;      // 服务端下发的已知字段清单 {txt2img: [elem_id...], ...}
     var saveTimer = null;
 
+    // v1.4.21：插件自身设置控件（prompt-helper-* 容器内，含启用开关 / 正反向
+    // 路径 / 编辑器路径等）**不进页面快照通道**——它们由服务端 config /
+    // settings.pin 权威初始化，程序化回放会 dispatch input/change 触发服务端
+    // 持久化链（_persist_pin_key / _save_config），把脏 DOM 值（含索引错位
+    // 塞入的史前值）写进 config / pin。2026-09-17 15:20 生产事故根因：
+    // 按索引回放 + 布局变更错位 → pin.enabled=False + config.path=None →
+    // 生成图提示词全空。采集与回放双侧跳过，双保险。
+    function isPluginControl(el) {
+        try { return !!el.closest('[id^="prompt-helper-"]'); } catch (e) { return false; }
+    }
+
     function readValue(root) {
         try {
             var cb = root.querySelector("input[type=checkbox]");
@@ -437,6 +448,7 @@
             var generic = [];
             for (var i = 0; i < inputs.length; i += 1) {
                 var el = inputs[i];
+                if (isPluginControl(el)) continue;  // v1.4.21：插件设置控件不入快照
                 if (el.type === "checkbox") generic.push({ checkbox: el.checked });
                 else if (typeof el.value === "string") generic.push({ text: el.value });
             }
@@ -511,8 +523,16 @@
                     var list = state[id];
                     if (!box || !Array.isArray(list)) return;
                     var inputs = box.querySelectorAll("input, textarea");
-                    for (var i = 0; i < list.length && i < inputs.length; i += 1) {
-                        applyValueToInput(inputs[i], list[i]);
+                    var idx = 0;
+                    for (var i = 0; i < inputs.length && idx < list.length; i += 1) {
+                        var el = inputs[i];
+                        // v1.4.21：插件设置控件永不回放（服务端 config/pin 权威）。
+                        // 过滤后的输入序列对位快照列表——部署后旧快照（仍含插件
+                        // 控件项）有一次性过渡错位，属 best-effort 档容忍范围
+                        //（受控字段由总线 apply 覆盖兜底），新快照覆盖后归正。
+                        if (isPluginControl(el)) continue;
+                        applyValueToInput(el, list[idx]);
+                        idx += 1;
                     }
                     return;
                 }

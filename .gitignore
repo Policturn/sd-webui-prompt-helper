@@ -15,3 +15,4 @@ bus.direct
 bus.page_state.json
 bus.page_state.disabled
 editor.hint
+config.audit.log

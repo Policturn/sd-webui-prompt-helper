@@ -168,6 +168,15 @@ setTimeout 盲等被 Chromium 节流到 ~3s+，压缩前 write→busy 实测 3.5
 - **原子写**：config.json / settings.pin / status.json 等一律"临时文件 +
   原子替换"落盘（替换窗口的短暂占用自动重试），编辑器面板与配置读取
   不会再见到半截 JSON。
+- **破坏性变更护栏（v1.4.21）**：插件设置（启用开关 / 正反向词条路径 /
+  编辑器路径）不允许被页面快照回放程序化改写——通用扫描采集与回放双双
+  跳过 `prompt-helper-*` 容器（设置由 config.json / settings.pin 权威
+  初始化）。服务端再加一层：`_save_config` 全量回写通道遇到「路径键磁盘
+  非空 → 新值空」的破坏性清空直接拒绝该键（保留旧值），`enabled`
+  True→False 与 pin 键的清空/翻转放行但全程留痕——审计追加在插件根
+  `config.audit.log`（JSON 行：时间 / 事件 / 键 / 旧新值 / 来源），config
+  读取损坏（文件存在但读不出）也留痕。背景：2026-09-17 生产事故（生成图
+  提示词全空）根因即页面状态回放按索引错位把脏 DOM 值写进插件控件。
 
 ### 总开关：bus.armed（v1.4.3+）
 
@@ -242,6 +251,11 @@ tiled 系可选组）当前值 + 脚本容器内其余输入的通用扫描，�
 > 注：回放依赖程序化设值让 gradio 拾取（dispatch input/change，A1111
 > updateInput 同款技巧），**对 gradio 版本敏感**——gradio 升级改 DOM 结构
 > 时可能部分失效；失效仅影响恢复（下拉类组件只采集不回放），不影响生成。
+
+> 注（v1.4.21）：**本插件自身的设置控件不进快照通道**（采集与回放均跳过
+> `prompt-helper-*` 容器）——插件设置由 config.json / settings.pin 权威
+> 初始化，程序化回放会经 change 事件触发服务端持久化链，历史上曾把脏 DOM
+> 值（含索引错位塞入的值）写进 config / pin 造成注入静默失效。
 
 以上总线文件均已被 .gitignore 排除；删除即完全复位（status.json 会在下次启动
 WebUI 且开关开启时重新生成）。

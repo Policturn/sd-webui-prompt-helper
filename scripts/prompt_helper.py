@@ -235,6 +235,30 @@ editor.hint（单行文本 = 编辑器 exe 绝对路径，编辑器侧在连接�
 可用）。hint 档**不写回 config**（与扫描档不同，保持单向传值语义）。
 读取容忍缺失 / 空 / 畸形（熔断守卫同款语义，无效 = 跳过该档）与编码
 兜底（utf-8-sig → gb18030，取首行剥引号）。ComfyUI 版同步镜像（v1.4.10）。
+
+v1.4.21（2026-09-17 15:20 生产事故根因修复 + 防复发护栏，仅 WebUI 版）：
+事故=用户生成图正反向 prompt 全空，污染态 settings.pin enabled=False（pin
+优先把总闸关死）+ config path=None（正向路径丢）。根因锁定（证据链见交接
+笔记）：v1.4.18 页面状态回放（feetag_generate.js 第三 IIFE）的通用扫描区
+**包含了本插件自己的 6 个控件**（AlwaysVisible 脚本 UI 渲染在
+{page}_script_container 内），按索引回放 + dispatch 原生 input/change →
+gradio 拾取 → _persist_pin_key（布尔键恒写显式值，含 False）与
+_persist_settings / before_process _save_config（全量 6 控件值写 config）
+被程序化触发。WebUI 多次重启（v1.4.18/19/20 布局变化 → script_container
+内组件数量 / 顺序变化）+ 用户 Chrome 旧页并存 → 索引错位 + 脏 DOM 值（含
+v2.4.1 史前 editor_path，经「回放 → 采集」自持循环永生）被写进插件控件。
+X-179 的「config editor_path 被写回 v2.8.2 旧值」同通道（UI 脏值 →
+change → 全量回写）。修复三层：① JS 根修——通用扫描采集与回放双双跳过
+prompt-helper-* 容器内输入（插件设置控件由服务端 config/pin 权威初始化，
+禁止页面快照通道触碰）；② _save_config 护栏——路径键（path /
+negative_path / editor_path）「磁盘非空 → 新值空 / None」属破坏性清空，
+拒绝该键写入、保留磁盘旧值（该通道是 before_process / change 的全量回写
+保险，清空路径从无合法用户场景——真实清空走 _persist_pin_key 单键链）；
+enabled True→False 不拦（用户关总闸是合法操作）但全程留痕；③ 审计留痕
+——破坏性翻转（含放行的）一律 _log + 追加插件根 config.audit.log JSON
+行（时间 / 来源 / 键 / 旧值 / 新值），_load_config 损坏（文件存在但读不
+出）也留痕（原先静默落默认值）。ComfyUI 版无 UI 回写链（config 仅手改、
+无 change 持久化、无页面快照机制），本轮不动（分叉规则）。
 """
 
 import base64
@@ -293,8 +317,12 @@ POSITIVE_PIN_PATH = os.path.join(EXT_DIR, "positive_path.pin")
 # 用户值恒优先，hint 只在用户未设置 / 已失效时兜住（零配置可用）。
 # 已被 .gitignore 排除。
 EDITOR_HINT_PATH = os.path.join(EXT_DIR, "editor.hint")
+# 破坏性变更审计日志（v1.4.21）：插件根 config.audit.log，JSON 行追加——
+# enabled True→False 翻转与路径键非空→空清空（含被护栏拦截的尝试）逐次留痕，
+# 事后追凶用。已被 .gitignore 排除。
+AUDIT_LOG_PATH = os.path.join(EXT_DIR, "config.audit.log")
 
-PLUGIN_VERSION = "1.4.20"
+PLUGIN_VERSION = "1.4.21"
 
 CONTROL_KEYS = ("enabled", "path", "negative_path", "merge_lines",
                 "autostart", "editor_path")
@@ -465,6 +493,8 @@ _cmd_lock = threading.Lock()
 # 可能来自生成线程（before_process）与 UI 线程（控件提交 / 启动按钮）并发，
 # 串行化 + _atomic_write_text 原子落盘共同消灭半截文件
 _config_lock = threading.Lock()
+# config 损坏留痕防重（v1.4.21）：load.corrupt 审计行进程内只记一次
+_config_corrupt_logged = False
 
 
 def bus_armed():
@@ -1220,6 +1250,23 @@ def _log(message):
     print(f"[prompt-helper] {message}")
 
 
+def _audit_log(event, key, old, new, source):
+    """破坏性变更留痕（v1.4.21，09-17 生产事故防复发）：console _log + 插件根
+    config.audit.log 追加 JSON 行（ts / event / key / old / new / source / plugin）。
+    event 语义：guard.block=已拦截（新值未落盘）、guard.flip=放行的 enabled 关闸、
+    pin.flip / pin.clear=pin 链放行的翻转 / 解除固定、load.corrupt=config 读取失败。
+    审计自身失败静默——不能反向破坏被审计的主流程。"""
+    _log(f"破坏性变更留痕（{event}）：{key} {old!r} → {new!r}（来源 {source}）")
+    try:
+        line = json.dumps({"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "event": event,
+                           "key": key, "old": old, "new": new, "source": source,
+                           "plugin": PLUGIN_VERSION}, ensure_ascii=False)
+        with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
 def _atomic_write_text(path, text):
     """原子写文本文件（v1.4.16，共享函数）：先写同目录临时文件再 os.replace
     覆盖目标（同卷原子操作，Windows / Linux 均原子）。读者（编辑器面板轮询 /
@@ -1263,6 +1310,15 @@ def _load_config():
         except (OSError, ValueError):
             if attempt < 2:
                 time.sleep(0.05)
+    if loaded is None and os.path.isfile(CONFIG_PATH):
+        # v1.4.21：文件存在但 3 次读不出（损坏 / 持续占用）——原先静默落默认值，
+        # 若恰逢 UI 提交保存会把"默认快照"回写盘上。护栏会拦路径清空，此处留痕
+        # 让损坏可观测（默认值 enabled=True 方向安全，不会关闸）；进程内只记
+        # 一次，损坏持续期间不随每次读取刷屏。
+        global _config_corrupt_logged
+        if not _config_corrupt_logged:
+            _config_corrupt_logged = True
+            _audit_log("load.corrupt", "-", "-", "-", "_load_config")
     if isinstance(loaded, dict):
         for key in CONTROL_KEYS:
             if key in loaded:
@@ -1276,6 +1332,22 @@ def _load_config():
 
 def _save_config(cfg):
     data = {key: cfg.get(key, DEFAULT_CONFIG[key]) for key in CONTROL_KEYS}
+    # v1.4.21 破坏性清空护栏（09-17 生产事故防复发）：本通道是 before_process /
+    # 控件 change 的**全量回写**，历史上是 config 被脏 UI 值冲掉的唯一写入面
+    #（旧页面内存值 / 程序化回放）。路径键「磁盘非空 → 新值空 / None」= 破坏性
+    # 清空，拒绝该键（保留磁盘旧值，其余键照写）+ 留痕——全量通道的空值从无
+    # 合法用户场景（真实清空走 _persist_pin_key 单键链，放行且留痕）；enabled
+    # True→False 不拦（用户关总闸是合法操作）但留痕。磁盘读失败时 _load_config
+    # 落默认值（路径全空）→ 拦截条件天然不成立，新装机零误伤。
+    disk = _load_config()
+    for key in ("path", "negative_path", "editor_path"):
+        old_val = str(disk.get(key) or "")
+        if old_val and not str(data.get(key) or "").strip():
+            _audit_log("guard.block", key, old_val, data.get(key), "_save_config")
+            data[key] = old_val
+    if disk.get("enabled") and not data.get("enabled"):
+        _audit_log("guard.flip", "enabled", disk.get("enabled"), data.get("enabled"),
+                   "_save_config")
     try:
         # v1.4.16 原子写 + 写锁：并发保存（生成线程 / UI 线程）不再有半截或交错
         with _config_lock:
@@ -1807,6 +1879,10 @@ def _persist_pin_key(key, value):
     data = _read_pin_json(SETTINGS_PIN_PATH)
     if key in _PATH_PIN_KEYS:
         normalized = _normalize_path(value)
+        # v1.4.21：pin 链的清空 = 用户显式"解除固定"（合法功能），放行但留痕——
+        # 09-17 事故中程序化回放同样能走到这里，审计行是事后追凶的唯一线索
+        if str(data.get(key) or "") and not normalized:
+            _audit_log("pin.clear", key, data.get(key), normalized, "_persist_pin_key")
         if normalized:
             data[key] = normalized
         else:
@@ -1819,6 +1895,11 @@ def _persist_pin_key(key, value):
             except OSError as e:
                 _log(f"{os.path.basename(legacy)} 写入失败（settings.pin 已照常处理）：{e}")
     else:
+        # v1.4.21：enabled / merge_lines / autostart 布尔键 True→False 翻转放行
+        #（用户关总闸是合法操作，拦截会造成"关不掉"的怪 bug）但留痕——事故中
+        # pin.enabled=False 正是把总闸关死的最后一击，审计行让它无处遁形
+        if key == "enabled" and data.get(key) is True and not bool(value):
+            _audit_log("pin.flip", key, data.get(key), bool(value), "_persist_pin_key")
         data[key] = bool(value)
     try:
         with _config_lock:
