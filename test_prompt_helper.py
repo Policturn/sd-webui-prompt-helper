@@ -877,6 +877,13 @@ finally:
 check("error 态不再触发看门狗（不重复写）", ns["_bus_watchdog_tick"]() is False)
 
 print("== 原子写：config / status 半截读根治（v1.4.16 盲测 P1 ④）==")
+# v1.4.24 死路径护栏配套：前置章节把真实存在的 prompt.txt 写进了临时 config
+#（旧值有效），短哨兵值 "P"/"Q" 会触发新护栏拒写。本节验证原子写机制而非
+# 护栏语义，先把磁盘基线重置为哨兵值（旧值自身无效 → 不触发死路径分支）。
+with open(ns["CONFIG_PATH"], "w", encoding="utf-8") as f:
+    json.dump({"enabled": True, "path": "P", "negative_path": "",
+               "merge_lines": True, "autostart": False, "editor_path": ""}, f,
+              ensure_ascii=False)
 ns["_save_config"]({"enabled": True, "path": "P", "negative_path": "",
                     "merge_lines": True, "autostart": False, "editor_path": ""})
 check("save_config 原子写：内容完整且无 .tmp- 残留",
@@ -1828,5 +1835,70 @@ check("v1.4.21 JS：通用扫描采集 + 回放双双跳过插件控件（isPlug
       _js_src.count("if (isPluginControl(el)) continue;") == 2)
 check("v1.4.21 JS：closest 钉死 prompt-helper-* 容器前缀",
       'el.closest(\'[id^="prompt-helper-"]\')' in _js_src)
+
+# ---- v1.4.24 死路径护栏（体检 H-2：editor_path 被脏回放写为已删版本）----
+print("== v1.4.24 死路径护栏 ==")
+REAL_EXE = os.path.join(TMP_DIR, "feetaghelper-v2.8.4.exe")
+DEAD_EXE = os.path.join(TMP_DIR, "feetaghelper-v2.4.1.exe")
+REAL_POS, REAL_POS2 = os.path.join(TMP_DIR, "pos.txt"), os.path.join(TMP_DIR, "pos2.txt")
+for _p in (REAL_EXE, REAL_POS, REAL_POS2):
+    with open(_p, "w", encoding="utf-8") as f:
+        f.write("x")
+
+# H-2 复现：旧值有效（exe 存在）→ 新值非空死路径（v2.4.1 已删）拒写
+_write_disk_config(path="", negative_path="", editor_path=REAL_EXE)
+audit_before = len(_audit_events())
+ns["_save_config"]({"enabled": True, "path": "", "negative_path": "",
+                    "merge_lines": False, "autostart": True, "editor_path": DEAD_EXE})
+disk = ns["_load_config"]()
+check("死路径①（H-2 复现）：editor_path 旧值有效 → 新值指向不存在的文件被拒（保留旧值）",
+      disk["editor_path"] == REAL_EXE)
+check("死路径①：同次调用未被破坏的键照常写入（merge_lines 翻转）", disk["merge_lines"] is False)
+check("死路径①：guard.deadpath 审计行在位（事件 / 键 / 旧新值 / 来源 / 版本齐）",
+      any(e["event"] == "guard.deadpath" and e["key"] == "editor_path" and e["old"] == REAL_EXE
+          and e["new"] == DEAD_EXE and e["source"] == "_save_config"
+          and e["plugin"] == ns["PLUGIN_VERSION"] for e in _audit_events()))
+
+# path 键同拦（三路径键共用同一循环）
+_write_disk_config(path=REAL_POS, negative_path="", editor_path="")
+ns["_save_config"]({"enabled": True, "path": os.path.join(TMP_DIR, "no-such.txt"),
+                    "negative_path": "", "merge_lines": True, "autostart": False,
+                    "editor_path": ""})
+check("死路径②：path 键同拦（正反向词条路径同族保护）",
+      ns["_load_config"]()["path"] == REAL_POS
+      and any(e["event"] == "guard.deadpath" and e["key"] == "path" for e in _audit_events()))
+
+# 活路径放行：旧值有效 → 新值同样存在的文件 = 正常换路径
+_write_disk_config(path=REAL_POS, negative_path="", editor_path="")
+audit_before = len(_audit_events())
+ns["_save_config"]({"enabled": True, "path": REAL_POS2, "negative_path": "",
+                    "merge_lines": True, "autostart": False, "editor_path": ""})
+disk = ns["_load_config"]()
+check("死路径③：活路径放行（新值存在 → 正常换路径落盘）且零审计行",
+      disk["path"] == REAL_POS2 and len(_audit_events()) == audit_before)
+
+# 空值旧护栏回归：旧值有效 → 新值空仍走 v1.4.21 guard.block（非 deadpath）
+_write_disk_config(path=REAL_POS, negative_path="", editor_path="")
+audit_before = len(_audit_events())
+ns["_save_config"]({"enabled": True, "path": "", "negative_path": "",
+                    "merge_lines": True, "autostart": False, "editor_path": ""})
+new_rows = _audit_events()[audit_before:]
+check("死路径④：空值回归——旧值有效 → 新值空仍是 guard.block（不落入 deadpath 分支）",
+      ns["_load_config"]()["path"] == REAL_POS
+      and any(e["event"] == "guard.block" and e["key"] == "path" for e in new_rows)
+      and not any(e["event"] == "guard.deadpath" for e in new_rows))
+
+# 旧值自身无效不拦：无可保护值，_resolve_editor_path 扫描档救援链不受冻结
+_write_disk_config(path="", negative_path="", editor_path=DEAD_EXE)
+audit_before = len(_audit_events())
+ns["_save_config"]({"enabled": True, "path": "", "negative_path": "",
+                    "merge_lines": True, "autostart": False,
+                    "editor_path": os.path.join(TMP_DIR, "feetaghelper-v2.6.0.exe")})
+disk = ns["_load_config"]()
+check("死路径⑤：旧值无效（自身已失效）→ 死路径新值不拦（扫描档救援写回链不受影响）",
+      disk["editor_path"].endswith("feetaghelper-v2.6.0.exe")
+      and len(_audit_events()) == audit_before)
+
+_write_disk_config(path=OLD_POS, negative_path=OLD_NEG, editor_path=OLD_EDT)  # 恢复现场
 
 print("\n全部测试通过 ✔")

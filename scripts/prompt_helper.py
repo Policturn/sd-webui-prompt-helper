@@ -298,6 +298,18 @@ v1.4.22（用户拍板单份化，论证档方案 C 第二步 + 三项追加决�
 v1.4.23（X-184 一行修，攒批不发版）：/feetag/bus/image 的 200 响应加
 Cache-Control: no-store——消除 WebView2 分钟级温存滞后，文件被删后编辑器
 图片列按 404 立即剔除（断链剔除契约的时效配套），缓存语义无其他变化。
+
+v1.4.24（体检 H-2 根修）：_save_config 护栏扩存在性校验——v1.4.21 清空
+护栏只拦「路径键磁盘非空 → 新值空」，09-18 H-2 实锤同一脏回放通道把
+editor_path 非空脏值（v2.4.1 死路径）直通落盘。现路径键（path /
+negative_path / editor_path）「旧值有效（指向存在的文件）→ 新值非空但指向
+不存在的文件」同样拒写该键、保留旧值 + 留痕（guard.deadpath）。取舍：用户
+真要换路径时新路径必然存在（选文件 / 探测写回得来），死路径新值在全量回写
+通道无合法用户场景，拦死安全；目标文件尚未创建的合法换路径走 settings.pin
+单键链照常生效（注入 / 启动时 pin 优先）。旧值自身无效时不拦（无可保护值，
+且 _resolve_editor_path 扫描档救援写回不经本函数）。ComfyUI 版无
+_save_config 全量回写通道（config 仅手改 + 扫描档写回，写回值必为实测存在
+的文件），无死路径写入面，本轮不动。
 """
 
 import base64
@@ -361,7 +373,7 @@ EDITOR_HINT_PATH = os.path.join(EXT_DIR, "editor.hint")
 # 事后追凶用。已被 .gitignore 排除。
 AUDIT_LOG_PATH = os.path.join(EXT_DIR, "config.audit.log")
 
-PLUGIN_VERSION = "1.4.23"
+PLUGIN_VERSION = "1.4.24"
 
 CONTROL_KEYS = ("enabled", "path", "negative_path", "merge_lines",
                 "autostart", "editor_path")
@@ -1388,7 +1400,8 @@ def _log(message):
 def _audit_log(event, key, old, new, source):
     """破坏性变更留痕（v1.4.21，09-17 生产事故防复发）：console _log + 插件根
     config.audit.log 追加 JSON 行（ts / event / key / old / new / source / plugin）。
-    event 语义：guard.block=已拦截（新值未落盘）、guard.flip=放行的 enabled 关闸、
+    event 语义：guard.block=已拦截（新值未落盘）、guard.deadpath=已拦截的
+    死路径回写（v1.4.24，新值未落盘）、guard.flip=放行的 enabled 关闸、
     pin.flip / pin.clear=pin 链放行的翻转 / 解除固定、load.corrupt=config 读取失败。
     审计自身失败静默——不能反向破坏被审计的主流程。"""
     _log(f"破坏性变更留痕（{event}）：{key} {old!r} → {new!r}（来源 {source}）")
@@ -1477,8 +1490,22 @@ def _save_config(cfg):
     disk = _load_config()
     for key in ("path", "negative_path", "editor_path"):
         old_val = str(disk.get(key) or "")
-        if old_val and not str(data.get(key) or "").strip():
+        new_val = str(data.get(key) or "").strip()
+        if old_val and not new_val:
             _audit_log("guard.block", key, old_val, data.get(key), "_save_config")
+            data[key] = old_val
+        elif (new_val and os.path.isfile(_normalize_path(old_val))
+              and not os.path.isfile(_normalize_path(new_val))):
+            # v1.4.24 死路径护栏（H-2）：09-18 实锤脏回放把 editor_path 写回
+            # v2.4.1 死路径而 v1.4.21 清空护栏只拦空值、放行了脏值。旧值有效
+            # → 新值非空却指向不存在的文件 = 同族破坏性回写，拒写该键留痕。
+            # 用户真要换路径时新路径必然存在（选文件 / 探测写回得来），死路径
+            # 新值在本全量通道无合法场景；目标文件尚未创建的合法换路径走
+            # settings.pin 单键链照常生效（注入 / 启动时 pin 优先，不受影响）。
+            # 旧值自身无效（空 / 也已失效）时不拦——没有可保护的有效值，且
+            # _resolve_editor_path 扫描档救援写回不经本函数，旧值死时拦了只会
+            # 把 config 冻结在死值上。
+            _audit_log("guard.deadpath", key, old_val, data.get(key), "_save_config")
             data[key] = old_val
     if disk.get("enabled") and not data.get("enabled"):
         _audit_log("guard.flip", "enabled", disk.get("enabled"), data.get("enabled"),
