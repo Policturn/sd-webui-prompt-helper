@@ -335,10 +335,11 @@ ns["_write_status"]("idle")
 check("status 首写 idle", os.path.isfile(ns["STATUS_PATH"]))
 with open(ns["STATUS_PATH"], encoding="utf-8") as f:
     first = json.load(f)
-check("status 结构（state/pass/images/error/ts/plugin/choices）",
+check("status 结构（state/pass/images/error/ts/plugin/choices [+ image_roots]）",
       first["state"] == "idle" and first["pass"] == 0 and first["images"] == []
       and first["error"] is None and isinstance(first["ts"], int)
-      and first["choices"] == {} and first["plugin"] == ns["PLUGIN_VERSION"])
+      and first["choices"] == {} and first["plugin"] == ns["PLUGIN_VERSION"]
+      and first.get("image_roots") == [])
 mtime_before = os.stat(ns["STATUS_PATH"]).st_mtime_ns
 ns["_write_status"]("idle")
 check("内容未变化不重写", os.stat(ns["STATUS_PATH"]).st_mtime_ns == mtime_before)
@@ -499,7 +500,10 @@ os.makedirs(ns["FEETAG_OUT_DIR"], exist_ok=True)
 
 
 class FakeImage:
-    def __init__(self):
+    def __init__(self, already_saved_as=None):
+        # v1.4.22：模拟 A1111 images.save_image 落盘后写回 PIL 对象的属性
+        # （images.py L736）——postprocess 上报的唯一路径来源；None = 未落盘
+        self.already_saved_as = already_saved_as
         self.save_paths = []
         self.save_kwargs = []
 
@@ -553,22 +557,35 @@ check("before_process：正常生成置 busy 且计数 +1", ns["_gen_pass"] == b
       and json.load(open(ns["STATUS_PATH"], encoding="utf-8"))["state"] == "busy")
 
 imgs = [FakeImage(), FakeImage(), FakeImage()]
+# v1.4.22：模拟 WebUI 原生落盘——日期子目录 + already_saved_as 精确路径
+OUT_ROOT = os.path.join(TMP_DIR, "webui_out", "txt2img-images")
+GRIDS_ROOT = os.path.join(TMP_DIR, "webui_out", "txt2img-grids")
+DAY_DIR = os.path.join(OUT_ROOT, "2026-09-18")
+os.makedirs(DAY_DIR, exist_ok=True)
+disk_paths = []
+for i, img in enumerate(imgs):
+    _p = os.path.join(DAY_DIR, f"0000{i}-19984680{i}.png")
+    with open(_p, "wb") as f:
+        f.write(b"png")
+    img.already_saved_as = _p
+    disk_paths.append(_p)
+gen_p.outpath_samples = OUT_ROOT
+gen_p.outpath_grids = GRIDS_ROOT
 script.postprocess(gen_p, FakeProcessed(imgs))
-saved = sorted(os.listdir(ns["FEETAG_OUT_DIR"]))
-check("postprocess：全部落盘 fth_ 时间戳命名", len(saved) == 3
-      and all(name.startswith("fth_") and name.endswith(".png") for name in saved)
-      and [img.save_paths[0] for img in imgs] == [os.path.join(ns["FEETAG_OUT_DIR"], n) for n in saved])
-check("postprocess：生成信息以 pnginfo 传递给 save",
-      all(img.save_kwargs and img.save_kwargs[0].get("pnginfo") is not None for img in imgs))
+check("postprocess：不再复制进 featag_out（v1.4.22 单份化核心）",
+      not os.listdir(ns["FEETAG_OUT_DIR"]))
 with open(ns["STATUS_PATH"], encoding="utf-8") as f:
     final = json.load(f)
-check("postprocess：状态 done + 绝对路径清单", final["state"] == "done"
-      and final["images"] == [os.path.join(ns["FEETAG_OUT_DIR"], n) for n in saved]
+check("postprocess：done + images=already_saved_as 精确路径（生成序）",
+      final["state"] == "done" and final["images"] == disk_paths
       and final["pass"] == before_pass + 1)
-img_noinfo = FakeImage()
-script.postprocess(gen_p, FakeProcessed([img_noinfo], info=None))
-check("postprocess：无生成信息时退回裸 save（不传 pnginfo）",
-      img_noinfo.save_kwargs == [{}])
+check("postprocess：image_roots 登记（samples + grids，abspath+realpath 归一化）",
+      ns["_norm_image_root"](OUT_ROOT) in final["image_roots"]
+      and ns["_norm_image_root"](GRIDS_ROOT) in final["image_roots"])
+img_nosave = FakeImage()  # samples_save 关闭 / API 未存盘：无 already_saved_as
+script.postprocess(gen_p, FakeProcessed([img_nosave], info=None))
+check("postprocess：无落盘路径的图跳过不上报（其余状态照写）",
+      _read_status_file()["images"] == [] and _read_status_file()["state"] == "done")
 
 print("== 总线总开关 bus.armed（v1.4.3 默认关）==")
 os.remove(ns["ARMED_PATH"])  # 拆除开关 → 总线全关
@@ -691,6 +708,39 @@ with open(ns["CMD_PATH"], "w", encoding="utf-8") as f:
     f.write('{"action": "gener')
 check("cmd 端点：半截 JSON 消费丢弃不触发", bus_cmd().status_code == 404
       and not os.path.isfile(ns["CMD_PATH"]))
+
+print("== v1.4.22：bus image 端点扩根授权（单份化路径契约）==")
+bus_image = fake_app.routes["GET /feetag/bus/image"]
+_norm_out = ns["_norm_image_root"](OUT_ROOT)
+_resp = bus_image(disk_paths[0])
+check("端点：授权根内完整路径 200 + CORS 头（推荐契约形态 = status.images 原样）",
+      _resp.status_code == 200
+      and _resp.headers.get("Access-Control-Allow-Origin") == "*")
+_rel = os.path.relpath(disk_paths[0], _norm_out)
+check("端点：相对子路径按最近 samples 根解析 200（跨日期目录重名在路径层解决）",
+      bus_image(_rel).status_code == 200)
+check("端点：正斜杠形态的子路径同样解析", bus_image(_rel.replace("\\", "/")).status_code == 200)
+check("端点：根外绝对路径 404（防穿越升级——basename 时代换成根白名单）",
+      bus_image(os.path.join(TMP_DIR, "config.json")).status_code == 404)
+check("端点：.. 越界形态 404", bus_image("..\\" + os.path.basename(disk_paths[0])).status_code == 404)
+check("端点：空名 404", bus_image("").status_code == 404)
+_gone = os.path.join(DAY_DIR, "00009-1.png")
+with open(_gone, "wb") as f:
+    f.write(b"x")
+check("端点：根内文件在位 200", bus_image(_gone).status_code == 200)
+os.unlink(_gone)
+check("端点：文件被删 404（编辑器按契约把 404 图从列表剔除）",
+      bus_image(_gone).status_code == 404)
+# 重启自愈：内存授权根清空 → 从 status.json 持久 image_roots 恢复
+ns["_image_roots"].clear()
+ns["_last_samples_root"] = ""
+check("重启自愈：内存根清空后从 status.json image_roots 恢复授权（含回填内存）",
+      bus_image(disk_paths[1]).status_code == 200
+      and _norm_out in ns["_image_roots"])
+check("重启自愈：恢复后相对子路径解析同样恢复", bus_image(_rel).status_code == 200)
+os.remove(ns["ARMED_PATH"])
+check("端点：总线关一律 404", bus_image(disk_paths[0]).status_code == 404)
+open(ns["ARMED_PATH"], "w").close()
 
 print("== 生成页总线：USDU 脚本选中契约（v1.4.7 平铺 params.usdu.enable）==")
 scriptsel_comp = FakeComp(choices=["None", "Ultimate SD upscale", "Latent"])
@@ -1009,9 +1059,11 @@ check("直发映射：页面插件键一律不映射（tiled/usdu/adetailer）",
       not any(str(k).startswith(("tiled", "usdu", "adetailer")) for k in payload))
 check("直发映射：prompt 恒空串（注入留给 before_process 钩子）",
       payload["prompt"] == "" and payload["negative_prompt"] == "")
+check("直发映射：save_images 恒 True（v1.4.22 单份化——API 默认 False 则直发图磁盘零副本）",
+      payload["save_images"] is True)
 p2 = ns["_direct_payload"]({"base": {"width": 512}, "hires": {"enable": False, "denoise": 0.5}})
 check("直发映射：hires 关闭不带 hr 键 / 缺键与 null 不进 payload",
-      p2 == {"prompt": "", "negative_prompt": "", "width": 512})
+      p2 == {"prompt": "", "negative_prompt": "", "width": 512, "save_images": True})
 
 # img2img 命令：直发明确报 error（HTTP 之前返回，离线可测）
 ns["_gen_pass"] = 0
@@ -1035,14 +1087,21 @@ finally:
     ns["_direct_running"] = False
     del modules_pkg.shared
 
-print("== v1.4.19：直发一轮 = 1 图 1 计数（X-174 双落盘双计根除）==")
+print("== v1.4.19/v1.4.22：直发一轮 = 1 图 1 计数（X-174 根除）+ WebUI 原生落盘 ==")
 # 场景重放：直发线程 _direct_generate 调 API 期间，API 处理线程同步跑脚本钩子
-# （before_process 注入/计数/busy → postprocess 落盘/done，均在 HTTP 响应返回
-# 之前完成）——mock urlopen 在吐响应体前执行钩子，忠实复刻 /sdapi/v1/txt2img
-# 服务端管线。旧版（直发线程自落盘自计数）在此场景恰产出 2 图 / pass 2。
+# （before_process 注入/计数/busy → postprocess 上报落盘路径/done，均在 HTTP
+# 响应返回之前完成）——mock urlopen 在吐响应体前执行钩子，忠实复刻
+# /sdapi/v1/txt2img 服务端管线。v1.4.22 起 payload 带 save_images:true，
+# API 线程内 WebUI 原生落盘 → already_saved_as 在位（此处以真实临时文件模拟）。
 os.makedirs(ns["FEETAG_OUT_DIR"], exist_ok=True)
 for _name in os.listdir(ns["FEETAG_OUT_DIR"]):
     os.unlink(os.path.join(ns["FEETAG_OUT_DIR"], _name))
+API_OUT_ROOT = os.path.join(TMP_DIR, "webui_out", "api-txt2img-images")
+API_DAY_DIR = os.path.join(API_OUT_ROOT, "2026-09-18")
+os.makedirs(API_DAY_DIR, exist_ok=True)
+API_PNG = os.path.join(API_DAY_DIR, "00001-965732128.png")
+with open(API_PNG, "wb") as f:
+    f.write(b"png")
 ns["_gen_pass"] = 0
 ns["_status_snapshot"] = None
 ns["_status_last"] = {"state": "idle", "images": None, "error": None, "adetailer": None}
@@ -1057,9 +1116,11 @@ _direct_api_state = {}
 def _fake_api_pipeline():
     """模拟 API 处理线程：真实 WebUI 里这两步在响应返回前于服务端跑完。"""
     api_p = FakeP()
+    api_p.outpath_samples = API_OUT_ROOT  # api.py L472 硬编码 samples 根
     script.before_process(api_p, True, REAL_TXT, "", True, False, "")  # 注入+计数+busy
     _direct_api_state["p"] = api_p
-    script.postprocess(api_p, FakeProcessed([FakeImage()], info="Steps: 5, Seed: 965732128"))
+    _img = FakeImage(already_saved_as=API_PNG)  # save_images:true → 原生落盘回写属性
+    script.postprocess(api_p, FakeProcessed([_img], info="Steps: 5, Seed: 965732128"))
 
 
 class _DirectResp:
@@ -1093,12 +1154,13 @@ finally:
     del modules_pkg.shared
 _files = os.listdir(ns["FEETAG_OUT_DIR"])
 _st = _read_status_file()
-check("直发一轮：恰 1 图落 featag_out（钩子唯一落盘，直发线程不再双写）",
-      len(_files) == 1)
-check("直发一轮：pass 恰 +1（before_process 唯一计数，直发线程不再双计）",
+check("直发一轮：featag_out 零新文件（v1.4.22 停复制，唯一副本在 WebUI 目录）",
+      not _files)
+check("直发一轮：pass 恰 +1（before_process 唯一计数，直发线程不双计）",
       ns["_gen_pass"] == 1 and _st["pass"] == 1)
-check("直发一轮：done 且 images 指向唯一落盘图", _st["state"] == "done"
-      and [os.path.basename(p) for p in _st["images"]] == _files)
+check("直发一轮：done 且 images 指向 WebUI 原生落盘图（含日期子目录）",
+      _st["state"] == "done" and _st["images"] == [API_PNG]
+      and ns["_norm_image_root"](API_OUT_ROOT) in _st["image_roots"])
 check("直发一轮：API 线程注入照常（直发 prompt 恒空，注入链是唯一来源）",
       "1girl" in _direct_api_state["p"].prompt)
 check("直发收尾：_direct_running 复位", ns["_direct_running"] is False)
@@ -1120,24 +1182,29 @@ _st = _read_status_file()
 check("直发失败：error 写出（钩子未运行，直发线程兜底）",
       _st["state"] == "error" and "api down" in (_st["error"] or ""))
 check("直发失败：不落新图不计数（before_process 未运行）",
-      ns["_gen_pass"] == 0 and len(os.listdir(ns["FEETAG_OUT_DIR"])) == 1)
+      ns["_gen_pass"] == 0 and not os.listdir(ns["FEETAG_OUT_DIR"]))
 
-print("== v1.4.19：页面链路回归 = 1 图 1 计数（行为零变化防改窜）==")
+print("== v1.4.19/v1.4.22：页面链路回归（与直发共用同一份钩子，语义不变）==")
 for _name in os.listdir(ns["FEETAG_OUT_DIR"]):
     os.unlink(os.path.join(ns["FEETAG_OUT_DIR"], _name))
+PAGE_PNG = os.path.join(DAY_DIR, "00004-7777777.png")
+with open(PAGE_PNG, "wb") as f:
+    f.write(b"png")
 ns["_gen_pass"] = 0
 ns["_status_snapshot"] = None
 ns["_status_last"] = {"state": "idle", "images": None, "error": None, "adetailer": None}
 ns["_write_status"]("idle")
 ns["set_bus_direct"](False)
 _page_p = FakeP()
+_page_p.outpath_samples = OUT_ROOT
 script.before_process(_page_p, True, REAL_TXT, "", True, False, "")
-script.postprocess(_page_p, FakeProcessed([FakeImage()], info="Steps: 24"))
+script.postprocess(_page_p, FakeProcessed([FakeImage(already_saved_as=PAGE_PNG)],
+                                          info="Steps: 24"))
 _files = os.listdir(ns["FEETAG_OUT_DIR"])
 _st = _read_status_file()
-check("页面链路一轮：1 图 1 计数 done（与直发共用同一份钩子，语义不变）",
-      len(_files) == 1 and ns["_gen_pass"] == 1 and _st["pass"] == 1
-      and _st["state"] == "done")
+check("页面链路一轮：1 图 1 计数 done（上报 WebUI 路径，featag_out 零文件）",
+      not _files and ns["_gen_pass"] == 1 and _st["pass"] == 1
+      and _st["state"] == "done" and _st["images"] == [PAGE_PNG])
 
 print("== Wave B：页面状态快照/恢复（bus.page_state.json）==")
 doc = ns["_page_state_document"]()

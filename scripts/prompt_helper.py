@@ -32,7 +32,8 @@ v1.4.2 起提供「生成」页总线（P1，生成页-实施设计.md）：编�
 轮询 cmd.json，点隐藏 apply 钮让服务端读 params.json 并以 gr.update 回填界面组件
 （语义键 → elem_id 选择器表见 _FIELD_TABLES，组件经 on_after_component 捕获），
 再由 JS 切页签点生成钮走 UI 队列。每次生成 before_process 置状态 busy、
-postprocess 把成品图存 featag_out/（毫秒时间戳命名）并置 done；ADetailer 内部
+postprocess 上报成图落盘路径并置 done（v1.4.2-1.4.21 时代是复制进
+featag_out/，v1.4.22 起单份化改报 WebUI 输出目录原生路径，见文末版本记录）；ADetailer 内部
 pass（_ad_inner 标记的 img2img p2）在所有钩子入口直接 return，不注入不计数不
 回传。v1.4.8 诊断补全：ADetailer postprocess_image 还会对 copy(外层 p) 做两次
 显式钩子重调（真机实证 extensions/adetailer/scripts/!adetailer.py L909/L926，
@@ -259,6 +260,40 @@ enabled True→False 不拦（用户关总闸是合法操作）但全程留痕�
 行（时间 / 来源 / 键 / 旧值 / 新值），_load_config 损坏（文件存在但读不
 出）也留痕（原先静默落默认值）。ComfyUI 版无 UI 回写链（config 仅手改、
 无 change 持久化、无页面快照机制），本轮不动（分叉规则）。
+
+v1.4.22（用户拍板单份化，论证档方案 C 第二步 + 三项追加决策）：
+① **停复制**——postprocess 不再往 featag_out/ 复制副本（磁盘双份根除），
+   status.json 的 images 改报 WebUI 实际落盘的精确路径：来源 = A1111
+   images.save_image 落盘后写回 PIL 对象的 already_saved_as（images.py
+   L736，官方 ui_tempdir.py L35-38 同款消费），postprocess 时机保存循环已
+   全部完成，processed.images 就是同一批对象。顺带根治旧副本"批次首图
+   infotext 贴所有图"的瑕疵（WebUI 原生逐图完整 parameters + fth_meta）。
+   未落盘的图（samples_save 关闭 / API 未存盘）无该属性，跳过不上报（打
+   日志）。featag_out 目录与存量图原样保留（图库登记源不动），新装机不再
+   创建。
+② **直发落盘走原生路**——_direct_payload 恒补 "save_images": true（API 默认
+   False → do_not_save_samples=True，不补则直发图磁盘零副本），直发图由
+   WebUI 按原生链路落盘，与页面图同目录体系（API 路径 outdir 硬编码
+   opts.outdir_txt2img_samples，忽略 outdir_samples 总覆盖键——A1111 自身
+   行为，插件不改写）。转移复制仅作原生路不通的兜底（当前未启用）。
+③ **status.json 新增 image_roots 字段**（授权根数组，abspath+realpath 归一
+   化，p.outpath_samples / p.outpath_grids 每轮登记、跨轮累积粘滞携带）——
+   编辑器据此 + images 完整路径取图。
+④ **bus image 端点扩根授权**——name 从 basename 升级为路径形态（推荐完整
+   绝对路径 = status.images 原样；相对子路径按最近 samples 根解析），授权 =
+   归一化后落在任一授权根内（commonpath + normcase 防穿越；realpath 解引用
+   符号链接后按落点判定——根外任意路径一律 404）。文件被用户删除同样 404，
+   编辑器按契约把 404 的图从列表剔除（用户决策：自删属自发行为）。重启后
+   授权根从 status.json 持久字段自愈恢复（_authorized_image_roots）。
+⑤ **存量修复工具** tools/repair_featag_out_meta.py（一次性，随部署跑）——
+   扫 featag_out 全部 fth_* 存量图，按"同轮多图 infotext 全同"判定①遗留的
+   瑕疵轮，有 WebUI 原件对应（种子 + 尺寸匹配）的用原件元数据原子重写，
+   无原件的（直发历史）按批量 seed 递增尽力重构，不可修复的列清单；默认
+   干跑预览，--apply 才写盘，报告落插件根 featag_out_meta_repair_report.json。
+   编辑器对接契约（路径形态变更）：status.images = WebUI 输出目录绝对路径
+   数组（含日期子目录，生成序，批次>1 时首元素可能是 grid）；取图 =
+   GET /feetag/bus/image?name=<encodeURIComponent(完整路径)>；404 = 未授权
+   / 文件已删 → 从展示列表剔除。ComfyUI 版无副本无总线，零改动。
 """
 
 import base64
@@ -322,7 +357,7 @@ EDITOR_HINT_PATH = os.path.join(EXT_DIR, "editor.hint")
 # 事后追凶用。已被 .gitignore 排除。
 AUDIT_LOG_PATH = os.path.join(EXT_DIR, "config.audit.log")
 
-PLUGIN_VERSION = "1.4.21"
+PLUGIN_VERSION = "1.4.22"
 
 CONTROL_KEYS = ("enabled", "path", "negative_path", "merge_lines",
                 "autostart", "editor_path")
@@ -485,6 +520,15 @@ _gen_pass = 0
 # applied_ts（不干扰 busy/done 状态机，编辑器轮询语义不变）
 _applied_ts = 0
 _status_last = {"state": "idle", "images": None, "error": None, "adetailer": None}
+# bus image 端点授权根（v1.4.22 单份化）：images 改报 WebUI 实际落盘路径
+# （already_saved_as）后，端点从"featag_out 根 + basename"升级为"授权根白名单
+# + 根下任意子路径"。_image_roots 为进程内累积的授权根（每轮 postprocess 从
+# p.outpath_samples / p.outpath_grids 登记，历史根不摘除——编辑器会话级图片
+# 历史最多 60 批，缩略图惰性加载会回头取旧批文件）；_last_samples_root 是
+# 最近一轮 samples 根，端点对相对子路径形态的 name 按它解析。重启后内存清空，
+# _authorized_image_roots 会从 status.json 持久携带的 image_roots 自愈恢复。
+_image_roots = []
+_last_samples_root = ""
 # cmd.json 原子消费锁（v1.4.6）：fastapi 线程池并发处理 GET /feetag/bus/cmd，
 # 锁 + 改名保证"读后即删"退路也只可能有一个赢家
 _cmd_lock = threading.Lock()
@@ -662,20 +706,28 @@ def _publish_choices():
         return {}
 
 
-def _write_status(state, images=None, error=None, adetailer=None, applied_ts=None):
-    """写 status.json（state/pass/images/error/ts + choices [+ adetailer] [+ applied_ts]）。
+def _write_status(state, images=None, error=None, adetailer=None, applied_ts=None, image_roots=None):
+    """写 status.json（state/pass/images/image_roots/error/ts + choices
+    [+ adetailer] [+ applied_ts]）。
 
-    内容签名（state/pass/images/error/adetailer/choices/applied_ts）未变化时不重写
-    ——客户端高频轮询的只是不再变化的文件，磁盘零增长；ts 仅在真实写入时刷新。
-    applied_ts（v1.4.13）：apply 完成毫秒时间戳，粘滞保留最近值（后续常规状态
-    写入原样携带，JS 的信号判据 applied_ts > cmd.ts 不受状态刷新冲掉）；显式
-    传参（_mark_applied）即刷新。任何写入异常只打日志，绝不影响生成。
+    内容签名（state/pass/images/error/adetailer/choices/applied_ts/image_roots）
+    未变化时不重写——客户端高频轮询的只是不再变化的文件，磁盘零增长；ts 仅在
+    真实写入时刷新。applied_ts（v1.4.13）：apply 完成毫秒时间戳，粘滞保留最近值
+    （后续常规状态写入原样携带，JS 的信号判据 applied_ts > cmd.ts 不受状态刷新
+    冲掉）；显式传参（_mark_applied）即刷新。image_roots（v1.4.22）：bus image
+    端点授权根，传入即并入 _image_roots 累积集合并粘滞携带（历史批次的图仍可
+    取；重启后端点从本字段自愈恢复授权）。任何写入异常只打日志，绝不影响生成。
     """
     global _status_snapshot, _applied_ts, _status_last
     if applied_ts:
         _applied_ts = int(applied_ts)
+    if image_roots:
+        for root in image_roots:
+            if root and root not in _image_roots:
+                _image_roots.append(root)
     choices = _publish_choices()
-    signature = json.dumps([state, _gen_pass, list(images or []), error, adetailer, choices, _applied_ts],
+    signature = json.dumps([state, _gen_pass, list(images or []), error, adetailer,
+                            choices, _applied_ts, list(_image_roots)],
                            ensure_ascii=False, default=str)
     with _status_lock:
         if signature == _status_snapshot:
@@ -684,6 +736,7 @@ def _write_status(state, images=None, error=None, adetailer=None, applied_ts=Non
             "state": state,
             "pass": _gen_pass,
             "images": list(images or []),
+            "image_roots": list(_image_roots),
             "error": error,
             "ts": int(time.time() * 1000),
             "plugin": PLUGIN_VERSION,
@@ -716,6 +769,77 @@ def _mark_applied():
     last = _status_last
     _write_status(last["state"], images=last["images"], error=last["error"],
                   adetailer=last["adetailer"], applied_ts=int(time.time() * 1000))
+
+
+# ---------------------------------------------------------------------------
+# bus image 授权根（v1.4.22 单份化）：images 上报 WebUI 实际落盘路径的配套
+# ---------------------------------------------------------------------------
+
+def _norm_image_root(path):
+    """授权根归一化：abspath + realpath（解符号链接）+ 大小写/分隔符规范化。
+
+    相对 outdir（settings 可配）按进程 cwd 解析——与 images.save_image 的
+    落盘行为同基准，保证根与 already_saved_as 路径在同一规范空间可比。"""
+    try:
+        return os.path.realpath(os.path.abspath(path or ""))
+    except Exception:
+        return ""
+
+
+def _is_under(path, root):
+    """路径包含判定（防穿越核心）：path 必须落在 root 之内（含 root 本身）。
+
+    commonpath 对不同盘符抛 ValueError（= 必然不在其下）；normcase 统一
+    Windows 大小写与斜杠方向后再比较。path / root 调用前均应已归一化。"""
+    try:
+        return os.path.normcase(os.path.commonpath([path, root])) == os.path.normcase(root)
+    except ValueError:
+        return False
+
+
+def _register_image_roots(p):
+    """从 processing 对象登记本轮授权根（p.outpath_samples / p.outpath_grids）。
+
+    返回本轮新登记的根列表（供 _write_status 并入持久集合）。p 在
+    before_process / postprocess 钩子时机都带这两个字段（构造时由 txt2img.py
+    L22 / api.py L472 赋值），postprocess 时全部落盘已完成（保存循环在
+    p.scripts.postprocess 之前），登记即生效。"""
+    global _last_samples_root
+    roots = []
+    for attr in ("outpath_samples", "outpath_grids"):
+        root = _norm_image_root(getattr(p, attr, None))
+        if root and root not in roots:
+            roots.append(root)
+    for root in roots:
+        if root not in _image_roots:
+            _image_roots.append(root)
+    samples = _norm_image_root(getattr(p, "outpath_samples", None))
+    if samples:
+        _last_samples_root = samples
+    return roots
+
+
+def _authorized_image_roots():
+    """端点可用的全部授权根：进程内累积集合 ∪ status.json 持久携带的
+    image_roots（重启自愈——内存集合清空后从磁盘状态恢复，并把恢复值
+    并回内存，后续轮次无需重复恢复；_last_samples_root 一并回填为首个
+    恢复根，注册顺序恒 samples 在先，相对子路径解析随之恢复）。读失败 /
+    字段缺失静默跳过。"""
+    global _last_samples_root
+    roots = list(_image_roots)
+    try:
+        with open(STATUS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        for root in data.get("image_roots") or []:
+            if isinstance(root, str) and root and root not in roots:
+                roots.append(root)
+        if len(roots) > len(_image_roots):
+            _image_roots.extend(roots[len(_image_roots):])
+    except Exception:
+        pass
+    if not _last_samples_root and _image_roots:
+        _last_samples_root = _image_roots[0]
+    return roots
 
 
 # ---------------------------------------------------------------------------
@@ -811,8 +935,15 @@ def _direct_payload(params):
     enable_hr、steps→hr_second_pass_steps、denoise→denoising_strength）。
     prompt / negative_prompt 恒空串：词条注入走 before_process 钩子读
     prompt.txt / params.prompt 快照（API 路径同样过全部脚本钩子，api-retest
-    R1 实证：payload 留空时注入链是提示词唯一来源）。"""
-    payload = {"prompt": "", "negative_prompt": ""}
+    R1 实证：payload 留空时注入链是提示词唯一来源）。
+    save_images 恒 True（v1.4.22 单份化）：API 请求默认 save_images=False
+    （api/models.py L108 → api.py L445 do_not_save_samples=True，WebUI 自己
+    不落盘）——不补此键直发图只存在于响应 base64 里，磁盘零副本。补上后
+    WebUI 按原生链路落盘（outdir 走 API 硬编码的 opts.outdir_txt2img_samples，
+    日期子目录 / 逐图完整 infotext 与页面链路同体系；注意 API 路径忽略
+    outdir_samples 总覆盖键——用户改过该键时页面与直发目录会不同，属 A1111
+    自身行为，插件不改写）。"""
+    payload = {"prompt": "", "negative_prompt": "", "save_images": True}
     base = params.get("base") if isinstance(params.get("base"), dict) else {}
     for key in ("width", "height", "seed", "sampler_name", "scheduler",
                 "steps", "cfg_scale", "batch_size", "n_iter"):
@@ -867,11 +998,11 @@ def _direct_generate(cmd):
             headers={"Content-Type": "application/json"}, method="POST")
         with urllib.request.urlopen(req, timeout=_DIRECT_API_TIMEOUT) as r:
             resp = json.loads(r.read().decode("utf-8"))
-        # 响应返回时 API 处理线程的 postprocess 已落盘 featag_out/ 并写 done、
+        # 响应返回时 API 处理线程的 postprocess 已上报落盘路径并写 done、
         # before_process 已注入并计数（钩子在 HTTP 响应之前同步跑完）。
         if not (resp.get("images") or []):
             raise RuntimeError("API 未返回任何图像")
-        _log("直发生成完成（成图由 postprocess 钩子回传 featag_out/）")
+        _log("直发生成完成（成图由 WebUI 原生落盘，postprocess 钩子上报路径）")
     except Exception as e:  # noqa: BLE001 - 直发兜底，任何异常都写 error 不外抛
         _log(f"直发生成失败：{e}")
         try:
@@ -2143,13 +2274,24 @@ class PromptHelperScript(scripts.Script):
                     _log(f"反向已注入 {neg_injected} 个 tag / {len(neg_tags)} 个字符（{neg_message}）")
 
     def postprocess(self, p, processed, *args):
-        """生成完成：成品图复制到 featag_out/（毫秒时间戳命名）并置状态 done。
+        """生成完成：上报 WebUI 原生落盘路径（already_saved_as）并置状态 done。
+
+        v1.4.22 单份化：不再往 featag_out/ 复制副本（磁盘双份根除），status.json
+        的 images 直接改报每张图在 WebUI 输出目录的精确路径——来源是 A1111
+        images.save_image 落盘后写回 PIL 对象的 already_saved_as 属性（images.py
+        L736，官方 ui_tempdir.py 同款消费），postprocess 时机全部保存已完成
+        （保存循环在 p.scripts.postprocess 之前），逐图自带完整 parameters
+        infotext + fth_meta（顺带根治旧副本"首图 infotext 贴所有图"的瑕疵）。
+        同轮登记授权根（p.outpath_samples / outpath_grids）进 status 的
+        image_roots，/feetag/bus/image 按根授权放行子路径（跨日期目录重名在
+        完整路径层解决）。未落盘的图（samples_save 关闭 / API 未存盘）没有
+        already_saved_as，跳过不上报。
 
         ADetailer 内部 pass（_ad_inner 标记的 p2）走不到这里（白名单+标记双隔离）；
         会到达的是它对 copy(外层 p) 的显式重调（真机实证 !adetailer.py L909：
         need_call_postprocess 时以 Processed(p, [], seed, "") 空壳重调本钩子）——
         空壳 images/info 全空，由此识别跳过，不再把状态提前置 done。
-        总开关关闭时整段跳过（不落图不写状态）。
+        总开关关闭时整段跳过（不写状态）。
         任何异常只置 error 状态 + 打日志，绝不影响生成任务本身。
         """
         if getattr(p, "_ad_inner", False) or not bus_armed():
@@ -2157,31 +2299,21 @@ class PromptHelperScript(scripts.Script):
         if not getattr(processed, "images", None) and not getattr(processed, "info", ""):
             return  # ADetailer 重调的空壳 Processed：无图可回传，别提前置 done
         try:
-            os.makedirs(FEETAG_OUT_DIR, exist_ok=True)
-            stamp = time.strftime("%Y%m%d_%H%M%S") + f"{int(time.time() * 1000) % 1000:03d}"
             saved = []
-            # 把生成信息（parameters）写进回传副本，编辑器拿到的图自证参数
-            geninfo = getattr(processed, "info", None)
-            pnginfo = None
-            if isinstance(geninfo, str) and geninfo:
-                try:
-                    from PIL import PngImagePlugin
-                    pnginfo = PngImagePlugin.PngInfo()
-                    pnginfo.add_text("parameters", geninfo)
-                except Exception:
-                    pnginfo = None
             for i, image in enumerate(list(processed.images or [])):
-                path = os.path.join(FEETAG_OUT_DIR, f"fth_{stamp}_{i}.png")
+                raw = getattr(image, "already_saved_as", None)
+                if not raw:
+                    continue
                 try:
-                    if pnginfo is not None:
-                        image.save(path, pnginfo=pnginfo)
-                    else:
-                        image.save(path)
-                    saved.append(path)
-                except (AttributeError, OSError, ValueError) as e:
-                    _log(f"回传图片 {i} 失败：{e}")
-            _write_status("done", images=saved, adetailer=_adetailer_marks(p))
-            _log(f"已回传 {len(saved)} 张图到 featag_out/")
+                    saved.append(os.path.abspath(raw))  # 相对 outdir 场景按 cwd 补全
+                except Exception as e:
+                    _log(f"上报图片 {i} 路径失败：{e}")
+            if len(saved) < len(processed.images or []):
+                _log(f"本轮 {len(processed.images or []) - len(saved)} 张图无落盘路径"
+                     "（samples_save 关闭或 API 未存盘），未上报")
+            _write_status("done", images=saved, adetailer=_adetailer_marks(p),
+                          image_roots=_register_image_roots(p))
+            _log(f"已上报 {len(saved)} 张图的落盘路径（WebUI 输出目录）")
         except Exception as e:  # noqa: BLE001 - 兜底，回传永不影响生成
             _log(f"回传异常：{e}")
             try:
@@ -2193,7 +2325,8 @@ class PromptHelperScript(scripts.Script):
 def _register_bus_endpoints(app):
     """注册总线端点（v1.4.4 只读 + v1.4.6 cmd 原子消费）：
       GET /feetag/bus/status         → status.json 内容（application/json）
-      GET /feetag/bus/image?name=xx  → featag_out/<name>（basename 防穿越）
+      GET /feetag/bus/image?name=xx  → 授权根（WebUI 输出目录）下按路径取图
+                                       （v1.4.22：根白名单 + 子路径授权防穿越）
       GET /feetag/bus/cmd            → 原子取走 cmd.json：读取并删除，每条命令
                                        全局恰有一个消费者取到（200），其余 404
     三者都带 Access-Control-Allow-Origin: *——编辑器面板（Tauri webview 的
@@ -2227,9 +2360,28 @@ def _register_bus_endpoints(app):
                         headers={"Access-Control-Allow-Origin": "*"})
 
     def _bus_image(name: str = ""):
+        """v1.4.22 单份化改写：name = WebUI 输出目录下的文件（完整绝对路径为
+        契约推荐形态，status.images 原样传入；也接受授权根下的相对子路径，按
+        最近一轮 samples 根解析——跨日期目录重名在完整路径层解决）。授权 =
+        归一化后落在任一授权根内（_image_roots / status.json image_roots，
+        _is_under 含 normcase + commonpath 防穿越：basename 时代挡的是 .. 越界，
+        现在挡的是任意路径——根外文件一律 404，符号链接经 realpath 解引用后
+        同样按落点判定）。文件不存在（用户已删）同样 404——编辑器按契约把
+        404 的图从列表剔除。"""
         if not bus_armed():
             return Response(status_code=404)
-        path = os.path.join(FEETAG_OUT_DIR, os.path.basename(name or ""))
+        raw = (name or "").strip()
+        if not raw:
+            return Response(status_code=404)
+        if not os.path.isabs(raw):
+            raw = os.path.join(_last_samples_root, raw)
+        try:
+            path = os.path.realpath(os.path.abspath(raw))
+        except Exception:
+            return Response(status_code=404)
+        roots = _authorized_image_roots()
+        if not roots or not any(_is_under(path, root) for root in roots):
+            return Response(status_code=404)
         if not os.path.isfile(path):
             return Response(status_code=404)
         return FileResponse(path, headers={"Access-Control-Allow-Origin": "*"})
@@ -2336,10 +2488,8 @@ def _on_app_started(demo=None, app=None):
     if app is not None:
         _register_bus_endpoints(app)
     if bus_armed():
-        try:
-            os.makedirs(FEETAG_OUT_DIR, exist_ok=True)
-        except OSError:
-            pass
+        # v1.4.22：不再创建 featag_out/（停复制；存量目录与图库登记源原样保留，
+        # 新装机从此不出现该目录）
         _write_status("idle")  # 总线启用时发初态（含 choices），编辑器据此判断插件在线
     # v1.4.12：自动启动消费点走 pin 覆盖后的有效配置（autostart / editor_path
     # 六键统一；launch_editor 内部还会再过一次 pin，手动改 pin 即刻生效）

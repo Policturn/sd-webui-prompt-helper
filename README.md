@@ -120,14 +120,32 @@ FeeTagHelper 构建区开启"携带元数据"时，txt 末尾会追加一个
 |---|---|---|---|
 | `params.json` | 编辑器 | 插件（apply 时读） | 要覆盖的参数，**只写要改的键**：`base`（width / height / seed / sampler_name / scheduler / steps / cfg_scale / batch_size / n_iter）+ `hires`（enable / upscaler / hr_scale / denoise / steps）+ `tiled` / `tiledvae`（分块放大，enable + 各参数）+ `usdu`（**enable=true 额外触发脚本下拉选中**，v1.4.7 契约平铺）+ `adetailer_infotext`（ADetailer 单行 infotext）；`img2img` / `extras` 段为后续版本预留 |
 | `cmd.json` | 编辑器 | 插件（服务端原子消费） | `{"action":"generate","page":"txt2img","ts":...}`，ts 递增防重放。浏览器 JS 经 `GET /feetag/bus/cmd` 轮询：服务端读取并**删除**该文件，每条命令全局恰有一个消费者取到（200），其余请求 404——多浏览器 / 多页签并存不再竞态抢指令（v1.4.6 修复） |
-| `status.json` | 插件 | 编辑器轮询 | `{"state":"idle/busy/done/error","pass":N,"images":[绝对路径],"error","ts","plugin","choices","applied_ts"}`；内容不变不重写；`choices` 为 WebUI 当前实际可用的采样器 / 调度 / 超分列表（编辑器下拉对齐用）；`applied_ts`（v1.4.13）为最近一次 apply 完成的毫秒时间戳（粘滞携带，浏览器 JS 的 apply 完成信号判据 `applied_ts > cmd.ts`）。只读端点 `GET /feetag/bus/status` |
-| `featag_out/` | 插件 | 编辑器 | 每次生成的成品图副本，`fth_年月日_时分秒毫秒_N.png` 命名。只读端点 `GET /feetag/bus/image?name=` |
+| `status.json` | 插件 | 编辑器轮询 | `{"state":"idle/busy/done/error","pass":N,"images":[绝对路径],"image_roots":[授权根],"error","ts","plugin","choices","applied_ts"}`；内容不变不重写；`choices` 为 WebUI 当前实际可用的采样器 / 调度 / 超分列表（编辑器下拉对齐用）；`applied_ts`（v1.4.13）为最近一次 apply 完成的毫秒时间戳（粘滞携带，浏览器 JS 的 apply 完成信号判据 `applied_ts > cmd.ts`）。只读端点 `GET /feetag/bus/status` |
+| `featag_out/` | 插件（历史） | 编辑器图库 | **v1.4.22 起停写**（单份化，见下）；目录与存量图原样保留（图库登记源不动）。只读端点 `GET /feetag/bus/image?name=` 同时服务存量与新版路径 |
+
+**图片路径契约（v1.4.22 单份化，破坏性变更）**：成品图不再复制进
+`featag_out/`——磁盘只存 WebUI 输出目录那份。`status.json` 的 `images` 改报
+**WebUI 实际落盘的精确绝对路径**（来源 = A1111 落盘后写回 PIL 对象的
+`already_saved_as`；含日期子目录，生成序，批次>1 时首元素可能是 grid；逐图
+自带完整 parameters infotext + `fth_meta`，根治旧副本"批次首图 infotext 贴
+所有图"的瑕疵）；新增 `image_roots` 字段 = 授权根数组（`p.outpath_samples` /
+`p.outpath_grids` 每轮登记、跨轮累积粘滞携带，重启后端点从本字段自愈恢复）。
+取图：`GET /feetag/bus/image?name=<encodeURIComponent(完整路径)>`（推荐形态
+= `status.images` 原样传入；也接受授权根下的相对子路径，按最近 samples 根
+解析——WebUI 序号命名跨日期目录天然重名，basename 形态已不可用）。授权 =
+归一化后落在任一授权根内，根外任意路径 / `..` 越界 / 符号链接出根一律 404；
+**文件被用户删除同样 404，编辑器按契约把 404 的图从展示列表剔除**（用户
+自删属自发行为）。未落盘的图（`samples_save` 关闭 / API 未存盘）无路径可报，
+跳过不上报（打日志）。存量 `fth_*` 图的"首图 infotext 贴所有图"瑕疵用
+`tools/repair_featag_out_meta.py` 一次性修复（默认干跑，`--apply` 实修，报告
+落插件根 `featag_out_meta_repair_report.json`）。
 
 触发链路：编辑器写 params.json → 写 cmd.json → JS 轮询 `/feetag/bus/cmd` 取到
 指令（恰一方）→ 点隐藏 apply 钮（服务端按
 语义键 → elem_id 选择器表把参数回填到界面组件：未出现的键不覆盖、越界夹取、
 下拉值非法跳过）→ JS 切到目标页签点生成钮 → WebUI 正常队列生成 → `postprocess`
-钩子把成品图存 featag_out/ 并置 done。Highres-fix 全参数同通道支持
+钩子上报成图的 WebUI 落盘路径并置 done（v1.4.22 前是复制进 featag_out/）。
+Highres-fix 全参数同通道支持
 （hr_checkpoint 中途换模型暂不接）。ADetailer 等扩展的内部重绘 pass
 （`_ad_inner` 标记）在插件所有钩子入口直接跳过——不注入词条、不计数、不回传。
 
@@ -226,14 +244,17 @@ bus.armed（编辑器按该文件决定开窗方式）：
   adetailer_infotext 等页面插件键在直发模式一律不映射）。prompt 词条注入
   不受影响（API 路径同样过注入钩子，含 v1.4.15 快照锁定）。
 - 逐请求实时判定，删 = 立即回页面模式；页面开关显示由 JS 15 秒探测同步。
-  直发需 WebUI 以 `--api` 启动，否则该次生成回 error 状态并提示。出图同样
-  落 `featag_out/`（带完整 parameters 信息）；busy/done/error 状态机、
+  直发需 WebUI 以 `--api` 启动，否则该次生成回 error 状态并提示。出图由
+  WebUI 原生落盘（v1.4.22：payload 恒带 `save_images: true`——API 默认不落盘，
+  不补则直发图磁盘零副本；outdir 走 API 路径硬编码的
+  `opts.outdir_txt2img_samples`，与页面图同目录体系，注意 API 路径忽略
+  `outdir_samples` 总覆盖键）；busy/done/error 状态机、
   pass 计数、进度端点照常（直发在途有看门狗护栏，不会误报卡死）。
   **落盘 / 计数由生成钩子统一完成（v1.4.19 收口）**：API 生成与页面生成
-  同走 before_process / postprocess 钩子——注入、pass 计数、featag_out
-  落盘、done 全部由钩子做且只做一次，直发线程只负责触发与异常兜底
+  同走 before_process / postprocess 钩子——注入、pass 计数、落盘路径上报、
+  done 全部由钩子做且只做一次，直发线程只负责触发与异常兜底
   （v1.4.18 曾由直发线程自落一份盘、自计一次 pass，与钩子合计同图双落盘
-  + pass 双计，v1.4.19 根治）。
+  + pass 双计，v1.4.19 根治；v1.4.22 前的 featag_out 复制亦已停）。
 
 ### 页面状态快照/恢复（v1.4.18+，best-effort）
 
