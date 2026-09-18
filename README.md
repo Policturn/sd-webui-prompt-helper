@@ -135,7 +135,8 @@ FeeTagHelper 构建区开启"携带元数据"时，txt 末尾会追加一个
 解析——WebUI 序号命名跨日期目录天然重名，basename 形态已不可用）。授权 =
 归一化后落在任一授权根内，根外任意路径 / `..` 越界 / 符号链接出根一律 404；
 **文件被用户删除同样 404，编辑器按契约把 404 的图从展示列表剔除**（用户
-自删属自发行为）。未落盘的图（`samples_save` 关闭 / API 未存盘）无路径可报，
+自删属自发行为）；200 响应带 `Cache-Control: no-store`（v1.4.23），消除
+WebView2 分钟级温存滞后——删除后立即剔除，不用等缓存过期。未落盘的图（`samples_save` 关闭 / API 未存盘）无路径可报，
 跳过不上报（打日志）。存量 `fth_*` 图的"首图 infotext 贴所有图"瑕疵用
 `tools/repair_featag_out_meta.py` 一次性修复（默认干跑，`--apply` 实修，报告
 落插件根 `featag_out_meta_repair_report.json`）。

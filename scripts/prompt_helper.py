@@ -294,6 +294,10 @@ v1.4.22（用户拍板单份化，论证档方案 C 第二步 + 三项追加决�
    数组（含日期子目录，生成序，批次>1 时首元素可能是 grid）；取图 =
    GET /feetag/bus/image?name=<encodeURIComponent(完整路径)>；404 = 未授权
    / 文件已删 → 从展示列表剔除。ComfyUI 版无副本无总线，零改动。
+
+v1.4.23（X-184 一行修，攒批不发版）：/feetag/bus/image 的 200 响应加
+Cache-Control: no-store——消除 WebView2 分钟级温存滞后，文件被删后编辑器
+图片列按 404 立即剔除（断链剔除契约的时效配套），缓存语义无其他变化。
 """
 
 import base64
@@ -357,7 +361,7 @@ EDITOR_HINT_PATH = os.path.join(EXT_DIR, "editor.hint")
 # 事后追凶用。已被 .gitignore 排除。
 AUDIT_LOG_PATH = os.path.join(EXT_DIR, "config.audit.log")
 
-PLUGIN_VERSION = "1.4.22"
+PLUGIN_VERSION = "1.4.23"
 
 CONTROL_KEYS = ("enabled", "path", "negative_path", "merge_lines",
                 "autostart", "editor_path")
@@ -2384,7 +2388,10 @@ def _register_bus_endpoints(app):
             return Response(status_code=404)
         if not os.path.isfile(path):
             return Response(status_code=404)
-        return FileResponse(path, headers={"Access-Control-Allow-Origin": "*"})
+        # v1.4.23：no-store 消除 WebView2 分钟级温存滞后——文件被删后图片列
+        # 立即按 404 剔除，不用等缓存过期（X-184 实测该滞后为唯一残留体验缺口）
+        return FileResponse(path, headers={"Access-Control-Allow-Origin": "*",
+                                           "Cache-Control": "no-store"})
 
     def _bus_cmd():
         if not bus_armed():

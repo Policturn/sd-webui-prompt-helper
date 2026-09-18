@@ -713,9 +713,10 @@ print("== v1.4.22：bus image 端点扩根授权（单份化路径契约）==")
 bus_image = fake_app.routes["GET /feetag/bus/image"]
 _norm_out = ns["_norm_image_root"](OUT_ROOT)
 _resp = bus_image(disk_paths[0])
-check("端点：授权根内完整路径 200 + CORS 头（推荐契约形态 = status.images 原样）",
+check("端点：授权根内完整路径 200 + CORS 头 + no-store（v1.4.23 断链剔除时效配套）",
       _resp.status_code == 200
-      and _resp.headers.get("Access-Control-Allow-Origin") == "*")
+      and _resp.headers.get("Access-Control-Allow-Origin") == "*"
+      and _resp.headers.get("Cache-Control") == "no-store")
 _rel = os.path.relpath(disk_paths[0], _norm_out)
 check("端点：相对子路径按最近 samples 根解析 200（跨日期目录重名在路径层解决）",
       bus_image(_rel).status_code == 200)
