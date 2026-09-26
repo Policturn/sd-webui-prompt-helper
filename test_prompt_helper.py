@@ -1263,11 +1263,15 @@ with tempfile.NamedTemporaryFile("w", suffix=".bat", delete=False) as f:
 ok, msg = ns["launch_editor"](bat_path)
 print(f"  独立进程启动 -> [{msg}]")
 check("独立进程启动成功", ok)
-time.sleep(0.3)
-try:
-    os.unlink(bat_path)
-except OSError:
-    pass
+# bat 由 detached cmd 解释执行：固定 sleep(0.3) 后 unlink 在系统忙时 cmd 可能仍握着句柄 →
+# PermissionError 落 try 残临时文件（竞态 flake）。改轮询删：等 cmd 退出释放句柄后删净
+# （0.1s × 100 = 10s 上限；@exit 0 正常毫秒级退出，超时自然放行保持原容错语义）。
+for _ in range(100):
+    try:
+        os.unlink(bat_path)
+        break
+    except OSError:
+        time.sleep(0.1)
 ns["_on_app_started"]()  # 临时配置 autostart 默认关闭，应直接返回
 check("autostart 关闭时启动回调无动作", True)
 
